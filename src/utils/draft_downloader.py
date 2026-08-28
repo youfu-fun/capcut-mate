@@ -663,6 +663,21 @@ def _copy_local_draft_to_jianying(
     try:
         if os.path.normcase(source_dir) != os.path.normcase(target_dir):
             if os.path.exists(target_dir):
+                existing_result = verify_local_draft_ready(
+                    draft_id,
+                    save_path=save_path,
+                )
+                if existing_result.ok:
+                    # 草稿 ID 对应一次不可变生成。重试导出时复用剪映已扫描的
+                    # 目录，不能删除再复制，否则新版剪映会从首页索引中移除它。
+                    trigger_directory_scan_with_robocopy(target_dir)
+                    logger.info(
+                        "Reusing existing Jianying draft without recopy: "
+                        "draft_id=%s target=%s",
+                        draft_id,
+                        target_dir,
+                    )
+                    return existing_result
                 shutil.rmtree(target_dir)
             os.makedirs(save_path, exist_ok=True)
             shutil.copytree(source_dir, target_dir)
