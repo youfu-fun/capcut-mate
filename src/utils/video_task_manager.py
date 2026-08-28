@@ -355,7 +355,7 @@ class VideoGenTaskManager:
                     task.draft_id,
                     export_error,
                 )
-                self._cleanup_files(task)
+                self._cleanup_files(task, preserve_draft=True)
                 self._persist_terminal_task(task)
                 return
 
@@ -367,7 +367,7 @@ class VideoGenTaskManager:
             task.error_message = str(e)
             task.progress = 0
             logger.exception(f"Task exception: {task.draft_url}, error: {e}")
-            self._cleanup_files(task)
+            self._cleanup_files(task, preserve_draft=True)
             self._persist_terminal_task(task)
     
     def _check_draft_duration(self, task: VideoGenTask) -> bool:
@@ -817,7 +817,12 @@ class VideoGenTaskManager:
                 paths.append(path)
         return paths
 
-    def _cleanup_files(self, task: VideoGenTask) -> None:
+    def _cleanup_files(
+        self,
+        task: VideoGenTask,
+        *,
+        preserve_draft: bool = False,
+    ) -> None:
         """
         将任务产生的临时文件加入延迟删除队列，由后台定时任务无限重试删除。
         """
@@ -831,12 +836,20 @@ class VideoGenTaskManager:
             )
 
         draft_path = os.path.join(config.DRAFT_SAVE_PATH, task.draft_id)
-        enqueue_path(draft_path, is_dir=True)
-        logger.info(
-            "Enqueued draft directory for deferred delete: draft_id=%s path=%s",
-            task.draft_id,
-            draft_path,
-        )
+        if preserve_draft:
+            logger.warning(
+                "Preserving draft directory after export failure: "
+                "draft_id=%s path=%s",
+                task.draft_id,
+                draft_path,
+            )
+        else:
+            enqueue_path(draft_path, is_dir=True)
+            logger.info(
+                "Enqueued draft directory for deferred delete: draft_id=%s path=%s",
+                task.draft_id,
+                draft_path,
+            )
     
     def _handle_result(self, upload_url: str, upload_failed: bool) -> Tuple[str, str]:
         """

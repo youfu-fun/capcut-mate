@@ -132,3 +132,40 @@ class TestVideoTaskManagerDeferredCleanup:
             dd.run_pending_deletes()
             assert not os.path.exists(mp4)
             assert not os.path.exists(draft_dir)
+
+    def test_export_failure_cleanup_preserves_draft_dir(self) -> None:
+        from datetime import datetime
+
+        from src.utils.video_task_manager import (
+            TaskStatus,
+            VideoGenTask,
+            VideoGenTaskManager,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            mp4 = os.path.join(td, "out.mp4")
+            open(mp4, "wb").close()
+            draft_root = os.path.join(td, "drafts")
+            draft_dir = os.path.join(draft_root, "d1")
+            os.makedirs(draft_dir)
+
+            task = VideoGenTask(
+                draft_url="http://example/openapi?draft_id=d1",
+                draft_id="d1",
+                status=TaskStatus.PROCESSING,
+                created_at=datetime.now(),
+                outfile=mp4,
+                export_outfile_history=[mp4],
+            )
+
+            with patch("src.utils.video_task_manager.config") as cfg:
+                cfg.DRAFT_SAVE_PATH = draft_root
+                VideoGenTaskManager()._cleanup_files(task, preserve_draft=True)
+
+            pending = dd.list_pending_paths()
+            assert dd._normalize_path(mp4) in pending
+            assert dd._normalize_path(draft_dir) not in pending
+
+            dd.run_pending_deletes()
+            assert not os.path.exists(mp4)
+            assert os.path.isdir(draft_dir)

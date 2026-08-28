@@ -193,18 +193,14 @@ def clear_draft_save_directory(
 
 
 def recover_from_export_failure() -> None:
-    """导出失败后：强杀剪映；仅当 ``DRAFT_SAVE_PATH`` 目录存在时再做草稿清理。"""
+    """导出失败后的非破坏性恢复。
+
+    剪映进程和草稿是排查、人工接管及重试所必需的现场，失败时不得自动
+    taskkill，也不得清理草稿根目录。清理函数仍保留给显式维护任务调用。
+    """
     logger.warning(
-        "Jianying export failed, recovering (draft path=%s, exists=%s)",
+        "Jianying export failed; preserving app and drafts for retry "
+        "(draft path=%s, exists=%s)",
         config.DRAFT_SAVE_PATH,
         draft_save_path_exists(),
     )
-    kill_jianying_process()
-    if draft_save_path_exists():
-        clear_draft_save_directory()
-    else:
-        logger.info(
-            "Skip draft directory cleanup after export failure: "
-            "DRAFT_SAVE_PATH does not exist (%s)",
-            config.DRAFT_SAVE_PATH,
-        )

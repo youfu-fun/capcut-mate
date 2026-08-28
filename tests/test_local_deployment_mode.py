@@ -6,95 +6,65 @@ from unittest.mock import patch
 import src.utils.draft_downloader as dd
 
 
-def test_local_generated_draft_is_copied_directly_into_jianying_root():
+def test_local_generated_draft_uses_original_http_download_pipeline():
     draft_id = "20260828150000abcdef12"
-    with tempfile.TemporaryDirectory() as project_output, tempfile.TemporaryDirectory() as jianying_root:
-        source_dir = os.path.join(project_output, draft_id)
-        asset_dir = os.path.join(source_dir, "assets", "videos")
-        os.makedirs(asset_dir)
-        source_asset = os.path.join(asset_dir, "clip.mp4")
-        with open(source_asset, "wb") as f:
-            f.write(b"video")
+    draft_url = f"http://127.0.0.1:30000/get_draft?draft_id={draft_id}"
+    files = [f"http://127.0.0.1:30000/output/draft/{draft_id}/draft_content.json"]
 
-        with open(os.path.join(source_dir, "draft_content.json"), "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "duration": 5_000_000,
-                    "materials": {
-                        "audios": [],
-                        "videos": [{"id": "v1", "path": source_asset}],
-                    },
-                },
-                f,
-            )
-        with open(os.path.join(source_dir, "draft_info.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
-        with open(os.path.join(source_dir, "draft_meta_info.json"), "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "draft_name": "old-name",
-                    "draft_fold_path": "C:/old",
-                    "draft_root_path": "C:/old",
-                },
-                f,
-            )
+    with tempfile.TemporaryDirectory() as project_output, tempfile.TemporaryDirectory() as jianying_root:
+        # 即使本机 output 中已有同 ID 草稿，也必须沿用作者原版下载链路，
+        # 由逐文件落盘和 robocopy 负责触发剪映扫描。
+        os.makedirs(os.path.join(project_output, draft_id))
+        target_dir = os.path.join(jianying_root, draft_id)
 
         with (
             patch.object(dd.config, "DRAFT_DIR", project_output),
             patch.object(dd.config, "DRAFT_SAVE_PATH", jianying_root),
-            patch.object(dd, "trigger_directory_scan_with_robocopy"),
-            patch.object(dd, "_get_draft_files_list") as get_files,
+            patch.object(dd, "_get_draft_files_list", return_value=files) as get_files,
+            patch.object(dd, "_download_all_files") as download_files,
         ):
-            result = dd.download_draft_with_result(
-                f"http://127.0.0.1:30000/get_draft?draft_id={draft_id}"
-            )
+            result = dd.download_draft_with_result(draft_url)
 
         assert result.ok is True
-        get_files.assert_not_called()
-
-        target_dir = os.path.join(jianying_root, draft_id)
-        with open(os.path.join(target_dir, "draft_content.json"), encoding="utf-8") as f:
-            content = json.load(f)
-        with open(os.path.join(target_dir, "draft_meta_info.json"), encoding="utf-8") as f:
-            meta = json.load(f)
-
-        expected_asset = os.path.join(target_dir, "assets", "videos", "clip.mp4")
-        assert content["materials"]["videos"][0]["path"] == expected_asset
-        assert os.path.isfile(expected_asset)
-        assert meta["draft_name"] == draft_id
-        assert os.path.normpath(meta["draft_fold_path"]) == os.path.normpath(target_dir)
-        assert os.path.normpath(meta["draft_root_path"]) == os.path.normpath(jianying_root)
-        assert os.path.isfile(os.path.join(target_dir, "draft_info.json"))
+        get_files.assert_called_once_with(draft_url)
+        download_files.assert_called_once_with(files, target_dir, draft_id)
 
 
-def test_existing_complete_jianying_draft_is_reused_without_recopy():
+def test_original_download_pipeline_rewrites_local_source_material_paths():
     draft_id = "20260828153000abcdef12"
     with tempfile.TemporaryDirectory() as project_output, tempfile.TemporaryDirectory() as jianying_root:
         source_dir = os.path.join(project_output, draft_id)
-        target_dir = os.path.join(jianying_root, draft_id)
-        os.makedirs(source_dir)
-        os.makedirs(target_dir)
+        source_asset_dir = os.path.join(source_dir, "assets", "videos")
+        os.makedirs(source_asset_dir)
+        source_asset = os.path.join(source_asset_dir, "clip.mp4")
+        with open(source_asset, "wb") as f:
+            f.write(b"source")
 
-        for directory, marker in ((source_dir, "source"), (target_dir, "target")):
-            with open(os.path.join(directory, "draft_content.json"), "w", encoding="utf-8") as f:
-                json.dump({"duration": 5_000_000, "marker": marker}, f)
-            with open(os.path.join(directory, "draft_meta_info.json"), "w", encoding="utf-8") as f:
-                json.dump({"draft_name": draft_id}, f)
+        target_dir = os.path.join(jianying_root, draft_id)
+        target_asset_dir = os.path.join(target_dir, "assets", "videos")
+        os.makedirs(target_asset_dir)
+        target_asset = os.path.join(target_asset_dir, "clip.mp4")
+        with open(target_asset, "wb") as f:
+            f.write(b"target")
+
+        content_path = os.path.join(target_dir, "draft_content.json")
+        with open(content_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "materials": {
+                        "audios": [],
+                        "videos": [{"id": "v1", "path": source_asset}],
+                    }
+                },
+                f,
+            )
 
         with (
             patch.object(dd.config, "DRAFT_DIR", project_output),
             patch.object(dd.config, "DRAFT_SAVE_PATH", jianying_root),
-            patch.object(dd, "trigger_directory_scan_with_robocopy") as scan,
-            patch.object(dd.shutil, "rmtree") as rmtree,
-            patch.object(dd.shutil, "copytree") as copytree,
         ):
-            result = dd.download_draft_with_result(
-                f"http://127.0.0.1:30000/get_draft?draft_id={draft_id}"
-            )
+            dd._update_json_file_paths(content_path, target_dir, draft_id)
 
-        assert result.ok is True
-        scan.assert_called_once_with(target_dir)
-        rmtree.assert_not_called()
-        copytree.assert_not_called()
-        with open(os.path.join(target_dir, "draft_content.json"), encoding="utf-8") as f:
-            assert json.load(f)["marker"] == "target"
+        with open(content_path, encoding="utf-8") as f:
+            content = json.load(f)
+        assert content["materials"]["videos"][0]["path"] == target_asset
