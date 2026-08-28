@@ -90,11 +90,11 @@ class ControlFinder:
     """控件查找器，封装部分与控件查找相关的逻辑"""
 
     @staticmethod
-    def desc_matcher(target_desc: str, depth: int = 2, exact: bool = False) -> Callable[[uia.Control, int], bool]:
+    def desc_matcher(target_desc: str, depth: Optional[int] = 2, exact: bool = False) -> Callable[[uia.Control, int], bool]:
         """根据full_description查找控件的匹配器"""
         target_desc = target_desc.lower()
         def matcher(control: uia.Control, _depth: int) -> bool:
-            if _depth != depth:
+            if depth is not None and _depth != depth:
                 return False
             full_desc: str = control.GetPropertyValue(30159).lower()
             return (target_desc == full_desc) if exact else (target_desc in full_desc)
@@ -126,7 +126,64 @@ class JianyingController:
 
     def __init__(self):
         """初始化剪映控制器, 此时剪映应该处于目录页"""
+        # 新版剪映将导出面板嵌在主编辑窗口中，导出开始后需要保留流程状态，
+        # 否则进度页（开始按钮已经消失）会再次被误判为普通编辑页。
+        self._export_flow_active = False
         self.get_window()
+
+    def _make_desc_text_control(
+        self,
+        target_desc: str,
+        *,
+        root: Optional[uia.Control] = None,
+        exact: bool = False,
+        search_depth: int = 8,
+    ) -> uia.Control:
+        """跨层级查找 QML full_description，兼容新旧版剪映 UI 层级。"""
+        if root is None:
+            root = self.app
+        return root.TextControl(
+            searchDepth=search_depth,
+            Compare=ControlFinder.desc_matcher(
+                target_desc,
+                depth=None,
+                exact=exact,
+            ),
+        )
+
+    def _has_embedded_export_panel(self) -> bool:
+        """判断主编辑窗口中是否已打开新版内嵌导出面板。"""
+        for desc in ("ExportOkBtn", "ExportPath"):
+            if self._safe_exists(
+                lambda desc=desc: self._make_desc_text_control(
+                    desc,
+                    exact=(desc == "ExportOkBtn"),
+                ),
+                f"has_embedded_export_panel.{desc}",
+                timeout=0,
+            ):
+                return True
+        return False
+
+    def _find_export_window(self) -> Optional[uia.WindowControl]:
+        """查找导出弹窗，兼容子窗口、系统顶层窗口及带后缀的标题。"""
+        candidates = (
+            self.app.WindowControl(searchDepth=2, Name="导出"),
+            uia.WindowControl(searchDepth=1, Name="导出"),
+            uia.WindowControl(
+                searchDepth=1,
+                Compare=self.__jianying_export_window_cmp,
+            ),
+        )
+        for index, candidate in enumerate(candidates):
+            if self._exists_with_com_retry(
+                candidate,
+                f"find_export_window.candidate[{index}]",
+                timeout=0,
+                raise_on_exhausted=False,
+            ):
+                return candidate
+        return None
 
     def _safe_click(
         self,
@@ -253,10 +310,12 @@ class JianyingController:
     def _make_export_succeed_close_btn(self, *, from_export_window: bool = False) -> uia.Control:
         root = self.app
         if from_export_window:
-            root = self.app.WindowControl(searchDepth=2, Name="导出")
-        return root.TextControl(
-            searchDepth=2 if from_export_window else 3,
-            Compare=ControlFinder.desc_matcher("ExportSucceedCloseBtn"),
+            export_window = self._find_export_window()
+            if export_window is not None:
+                root = export_window
+        return self._make_desc_text_control(
+            "ExportSucceedCloseBtn",
+            root=root,
         )
 
     def _find_export_succeed_close_btn(self) -> Optional[uia.Control]:
@@ -304,6 +363,7 @@ class JianyingController:
             self._require_export_succeed_close_btn,
             "dismiss_export_success_dialog",
         )
+        self._export_flow_active = False
         time.sleep(2)
         self.get_window()
         return True
@@ -329,11 +389,17 @@ class JianyingController:
         last_exception = None
         for attempt in range(max_retries):
             try:
-                # 点击对应草稿
-                draft_name_text = self.app.TextControl(
-                    searchDepth=2,
-                    Compare=ControlFinder.desc_matcher(f"HomePageDraftTitle:{draft_name}", exact=True)
+                # 新版剪映首页增加了多层 QML 容器，草稿标题不再固定处于第 2 层。
+                # 优先按 full_description 查找，再以可见标题 Name 兜底。
+                draft_name_text = self._make_desc_text_control(
+                    f"HomePageDraftTitle:{draft_name}",
+                    exact=True,
                 )
+                if not draft_name_text.Exists(0):
+                    draft_name_text = self.app.TextControl(
+                        searchDepth=8,
+                        Name=draft_name,
+                    )
                 if not draft_name_text.Exists(0):
                     raise exceptions.DraftNotFound(f"未找到名为{draft_name}的剪映草稿")
                 draft_btn = draft_name_text.GetParentControl()
@@ -341,6 +407,13 @@ class JianyingController:
                 draft_btn.Click(simulateMove=False)
                 time.sleep(10)
                 self.get_window()
+                if self.app_status == "home":
+                    # 某些新版首页标题父节点只是布局容器，直接双击标题进入草稿。
+                    draft_name_text.DoubleClick(simulateMove=False)
+                    time.sleep(10)
+                    self.get_window()
+                if self.app_status == "home":
+                    raise AutomationError(f"找到草稿{draft_name}，但无法打开草稿卡片")
                 return  # 成功则返回
             except exceptions.DraftNotFound as e:
                 last_exception = e
@@ -386,7 +459,7 @@ class JianyingController:
             AutomationError: 未找到导出路径框
         """
         # 获取原始导出路径（带后缀名）
-        export_path_sib = self.app.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("ExportPath"))
+        export_path_sib = self._make_desc_text_control("ExportPath")
         if not export_path_sib.Exists(0):
             raise AutomationError("未找到导出路径框")
         export_path_text = export_path_sib.GetSiblingControl(lambda ctrl: True)
@@ -454,10 +527,11 @@ class JianyingController:
         Raises:
             AutomationError: 未找到导出按钮
         """
-        export_btn = self.app.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("ExportOkBtn", exact=True))
+        export_btn = self._make_desc_text_control("ExportOkBtn", exact=True)
         if not export_btn.Exists(0):
             raise AutomationError("未在导出窗口中找到导出按钮")
         export_btn.Click(simulateMove=False)
+        self._export_flow_active = True
         time.sleep(5)
 
     def __ensure_window_focus(self) -> None:
@@ -506,6 +580,7 @@ class JianyingController:
                     self._require_export_succeed_close_btn,
                     "wait_for_export_completion.close_success",
                 )
+                self._export_flow_active = False
                 time.sleep(2)
                 export_succeeded = True
                 break
@@ -525,9 +600,16 @@ class JianyingController:
 
     def return_to_home(self) -> None:
         """回到目录页并稍作延迟"""
+        # 导出已经完成，允许主窗口重新识别为编辑页并关闭草稿。
+        self._export_flow_active = False
         self.get_window()
         self._dismiss_export_success_dialog()
-        self.switch_to_home()
+        try:
+            self.switch_to_home()
+        except AutomationError as exc:
+            # 成片已经导出时，清理页面失败不应把整个任务判成失败；同时绝不
+            # 再通过固定序号点击标题栏按钮，以免新版剪映被误关闭。
+            logger.warning("Export completed but cannot return to home safely: %s", exc)
         time.sleep(2)
 
     def move_exported_file(self, original_path: str, output_path: Optional[str]) -> None:
@@ -662,28 +744,41 @@ class JianyingController:
                 continue
 
             if self.app_status == "edit":
-                close_btn = self.app.GroupControl(
-                    searchDepth=1,
-                    ClassName="TitleBarButton",
-                    foundIndex=3,
+                # 旧实现按 foundIndex=3 点击 TitleBarButton；新版剪映控件顺序
+                # 已变化，该位置可能是系统关闭按钮，会直接把剪映退出。
+                for desc in (
+                    "MainWindowTitleBarBackBtn",
+                    "MainWindowTitleBarHomeBtn",
+                ):
+                    if self._safe_exists(
+                        lambda desc=desc: self._make_desc_text_control(
+                            desc,
+                            exact=True,
+                        ),
+                        f"switch_to_home.find_{desc}[{i}]",
+                        timeout=0,
+                    ):
+                        self._safe_click(
+                            lambda desc=desc: self._make_desc_text_control(
+                                desc,
+                                exact=True,
+                            ),
+                            f"switch_to_home.click_{desc}[{i}]",
+                        )
+                        time.sleep(2)
+                        break
+                else:
+                    # Alt+Left 是无破坏性的导航兜底；失败时停止自动化，要求
+                    # 人工回首页，也不能再冒险点击未知标题栏按钮。
+                    pyautogui.hotkey("alt", "left")
+                    time.sleep(2)
+
+                self.get_window()
+                if self.app_status == "home":
+                    return
+                raise AutomationError(
+                    "无法安全返回剪映首页，请手动返回首页后重试"
                 )
-                if not close_btn.Exists(1, 0.5):
-                    logger.warning(
-                        "switch_to_home: edit close button missing, attempt=%d",
-                        i,
-                    )
-                    time.sleep(1)
-                    continue
-                self._safe_click(
-                    lambda: self.app.GroupControl(
-                        searchDepth=1,
-                        ClassName="TitleBarButton",
-                        foundIndex=3,
-                    ),
-                    f"switch_to_home.edit_close[{i}]",
-                )
-                time.sleep(2)
-                continue
 
             raise AutomationError("invalid app status: %s" % self.app_status)
 
@@ -747,16 +842,21 @@ class JianyingController:
                 % (max_retries, retry_interval)
             )
 
-        # 寻找可能存在的导出窗口
-        export_window = self.app.WindowControl(searchDepth=1, Name="导出")
-        if self._exists_with_com_retry(
-            export_window,
-            "get_window.find_export",
-            timeout=0,
-            raise_on_exhausted=False,
-        ):
+        # 寻找可能存在的导出窗口。新版剪映可能将它放在系统顶层，
+        # 而不是剪映主窗口的直接子节点，标题也可能带额外文本。
+        export_window = self._find_export_window()
+        if export_window is not None:
             self.app = export_window
             self.app_status = "pre_export"
+        elif self.app_status == "edit":
+            # 剪映 7+ 的导出页不再是独立 WindowControl，而是嵌在主编辑窗口内。
+            # 开始页可通过 ExportOkBtn/ExportPath 识别；点击开始后依靠流程状态
+            # 持续判定为 pre_export，直到成功页被关闭。
+            embedded_export_panel = self._has_embedded_export_panel()
+            if embedded_export_panel or getattr(self, "_export_flow_active", False):
+                self.app_status = "pre_export"
+                if embedded_export_panel:
+                    logger.info("Detected embedded export panel in Jianying edit window")
 
         # 初始化导出子状态
         self.init_export_sub_status()
@@ -773,18 +873,23 @@ class JianyingController:
             self.app_sub_status = "exporting"
             
             # 1. 检查窗口是否停留在导出开始页面
-            export_ok_btn = self.app.TextControl(searchDepth=2, Compare=ControlFinder.desc_matcher("ExportOkBtn", exact=True))
-            if export_ok_btn.Exists(0):
-                self.app_sub_status = "export_start"
-                return
-
-            # 2. 检查窗口是否停留在导出完成页面
+            # 1. 先检查导出完成页。新版剪映成功页也可能嵌在主窗口深层。
             if self._safe_exists(
                 lambda: self._make_export_succeed_close_btn(from_export_window=False),
                 "init_export_sub_status.export_succeed",
                 timeout=0,
             ):
                 self.app_sub_status = "export_succeed"
+                return
+
+            # 已点击最终导出按钮后，即使旧按钮仍暂时留在 UIA 树中，也应视为导出中。
+            if getattr(self, "_export_flow_active", False):
+                return
+
+            # 2. 检查窗口是否停留在导出开始页面
+            export_ok_btn = self._make_desc_text_control("ExportOkBtn", exact=True)
+            if export_ok_btn.Exists(0):
+                self.app_sub_status = "export_start"
                 return
         else:
             self.app_sub_status = "none"
@@ -814,3 +919,15 @@ class JianyingController:
 
         logger.info("ClassName: %s, Name: %s", class_name_lower, name.lower())
         return False
+
+    def __jianying_export_window_cmp(self, control: uia.WindowControl, depth: int) -> bool:
+        """匹配新版剪映的系统顶层导出弹窗。"""
+        if depth != 1:
+            return False
+        try:
+            name = (control.Name or "").strip().lower()
+        except Exception as exc:
+            if is_com_uia_error(exc):
+                return False
+            raise
+        return bool(name and name != "剪映专业版" and "导出" in name)

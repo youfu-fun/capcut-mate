@@ -1,6 +1,7 @@
 import os
 import uuid
 import pymediainfo
+from copy import deepcopy
 
 from typing import Optional, Literal
 from typing import Dict, Any
@@ -196,3 +197,79 @@ class AudioMaterial:
             "type": "extract_music",
             "wave_points": []
         }
+
+
+class CapCutAudioResourceMaterial(AudioMaterial):
+    """剪映/CapCut 内置音乐或音效资源。
+
+    与 :class:`AudioMaterial` 不同，该素材不依赖本地文件，而是由剪映在打开
+    草稿时根据 ``music_id`` 或 ``effect_id`` 解析。不同剪映版本可能包含额外
+    字段，因此允许透传一份从真实草稿中读取的 ``resource_metadata``。
+    """
+
+    resource_id: str
+    resource_kind: Literal["music", "sound_effect"]
+    resource_metadata: Dict[str, Any]
+
+    def __init__(
+        self,
+        resource_id: str,
+        duration: int,
+        *,
+        resource_kind: Literal["music", "sound_effect"] = "music",
+        material_name: Optional[str] = None,
+        resource_metadata: Optional[Dict[str, Any]] = None,
+    ):
+        if not isinstance(resource_id, str) or not resource_id.strip():
+            raise ValueError("resource_id 不能为空")
+        if resource_kind not in ("music", "sound_effect"):
+            raise ValueError("resource_kind 仅支持 music 或 sound_effect")
+        if not isinstance(duration, int) or duration <= 0:
+            raise ValueError("duration 必须是正整数（微秒）")
+        if resource_metadata is not None and not isinstance(resource_metadata, dict):
+            raise ValueError("resource_metadata 必须是对象")
+
+        self.material_id = uuid.uuid4().hex
+        self.resource_id = resource_id.strip()
+        self.resource_kind = resource_kind
+        self.material_name = material_name or self.resource_id
+        self.path = ""
+        self.duration = duration
+        self.resource_metadata = deepcopy(resource_metadata or {})
+
+    def export_json(self) -> Dict[str, Any]:
+        """导出到 ``materials.audios``，保留版本相关的扩展元数据。"""
+        payload: Dict[str, Any] = {
+            "app_id": 0,
+            "category_id": "",
+            "category_name": "",
+            "check_flag": 3,
+            "copyright_limit_type": "none",
+            "duration": self.duration,
+            "effect_id": "",
+            "formula_id": "",
+            "id": self.material_id,
+            "local_material_id": self.material_id,
+            "music_id": "",
+            "name": self.material_name,
+            "path": "",
+            "resource_id": self.resource_id,
+            "source_platform": 0,
+            "type": "music" if self.resource_kind == "music" else "sound",
+            "wave_points": [],
+        }
+        payload.update(deepcopy(self.resource_metadata))
+
+        # 这些字段决定时间线引用关系，不能被旧草稿元数据覆盖。
+        payload["id"] = self.material_id
+        payload["local_material_id"] = self.material_id
+        payload["duration"] = self.duration
+        payload["resource_id"] = self.resource_id
+        payload["type"] = "music" if self.resource_kind == "music" else "sound"
+        if self.resource_kind == "music":
+            payload["music_id"] = self.resource_id
+            payload["effect_id"] = ""
+        else:
+            payload["effect_id"] = self.resource_id
+            payload["music_id"] = ""
+        return payload

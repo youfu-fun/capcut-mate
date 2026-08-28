@@ -413,30 +413,39 @@ def add_video_to_draft(
         # 1. 创建视频素材
         video_material = draft.VideoMaterial(video_path)
         
-        # 2. 获取视频播放时长（target duration）
-        target_duration = video.get('duration', video['end'] - video['start'])
-        
         # 获取草稿的宽高用于transform坐标转换
         draft_width = script.width
         draft_height = script.height
-        logger.info(f"draft size: {draft_width}x{draft_height}, transform_x: {transform_x}, transform_y: {transform_y}")
+        item_transform_x = transform_x if video.get("transform_x") is None else video["transform_x"]
+        item_transform_y = transform_y if video.get("transform_y") is None else video["transform_y"]
+        item_alpha = alpha if video.get("alpha") is None else video["alpha"]
+        item_scale_x = scale_x if video.get("scale_x") is None else video["scale_x"]
+        item_scale_y = scale_y if video.get("scale_y") is None else video["scale_y"]
+        logger.info(
+            f"draft size: {draft_width}x{draft_height}, "
+            f"transform_x: {item_transform_x}, transform_y: {item_transform_y}"
+        )
 
         # 4. 创建图像调节设置
         clip_settings = draft.ClipSettings(
-            alpha=alpha,
-            scale_x=scale_x,
-            scale_y=scale_y,
-            transform_x=transform_x / draft_width,  #半画布宽单位
-            transform_y=transform_y / draft_height  #为半画布高单位
+            alpha=item_alpha,
+            scale_x=item_scale_x,
+            scale_y=item_scale_y,
+            transform_x=item_transform_x / draft_width,
+            transform_y=item_transform_y / draft_height,
+            rotation=video.get("rotation_degrees", 0.0),
         )
         
         # 5. 计算在时间轴上的显示时长（source duration）
         display_duration = video['end'] - video['start']
         
         # 5.5 计算变速（如果提供了场景时间线）
-        speed = 1.0
-        actual_duration = display_duration  # 默认实际时长等于显示时长
-        if scene_timeline:
+        source_start = video.get("source_start", 0)
+        explicit_source_end = video.get("source_end")
+        explicit_speed = video.get("playback_rate")
+        speed = float(explicit_speed) if explicit_speed is not None else 1.0
+        actual_duration = display_duration
+        if scene_timeline and explicit_speed is None and explicit_source_end is None:
             scene_duration = scene_timeline['end'] - scene_timeline['start']
             if scene_duration > 0:
                 # speed = 时间轴时长 / 场景时长
@@ -444,19 +453,43 @@ def add_video_to_draft(
                 speed = display_duration / scene_duration
                 actual_duration = scene_duration  # 实际播放时长为场景时长
                 logger.info(f"Video speed calculated: {speed}x (display_duration={display_duration}, scene_duration={scene_duration})")
+
+        if explicit_source_end is None:
+            source_end = min(
+                video_material.duration,
+                source_start + round(actual_duration * speed),
+            )
+        else:
+            source_end = explicit_source_end
+        source_duration = source_end - source_start
+        if source_start < 0 or source_end <= source_start or source_end > video_material.duration:
+            raise CustomException(
+                CustomError.VIDEO_ADD_FAILED,
+                f"Invalid source range: {source_start}-{source_end}",
+            )
+        rendered_duration = round(source_duration / speed)
+        if abs(rendered_duration - actual_duration) > 2:
+            raise CustomException(
+                CustomError.VIDEO_ADD_FAILED,
+                "source range, playback_rate and timeline duration disagree",
+            )
         
         # 6. 创建视频片段
         # 用户传入 volume 范围为 [0, 10]，剪映内部范围为 [0, 10]
         raw_volume = video.get('volume', 1.0)
         video_segment = draft.VideoSegment(
             material=video_material, 
-            target_timerange=trange(start=video['start'], duration=display_duration),
-            source_timerange=trange(start=0, duration=min(video_material.duration, display_duration)),
-            speed=speed,  # 使用计算出的速度
+            target_timerange=trange(start=video['start'], duration=actual_duration),
+            source_timerange=trange(start=source_start, duration=source_duration),
+            speed=speed,
             volume=raw_volume,
             clip_settings=clip_settings
         )
-        logger.info(f"video_path: {video_path}, start: {video['start']}, target_duration: {target_duration}, display_duration: {display_duration}, speed: {speed}, raw_volume: {raw_volume}")
+        logger.info(
+            f"video_path: {video_path}, start: {video['start']}, "
+            f"source_range: {source_start}-{source_end}, "
+            f"timeline_duration: {actual_duration}, speed: {speed}, raw_volume: {raw_volume}"
+        )
 
         # 6. 添加转场效果（如果指定了）
         transition_name = video.get('transition')
@@ -468,13 +501,13 @@ def add_video_to_draft(
                     transition_duration = int(transition_duration)
                 else:
                     transition_duration = None
-                try:
-                    video_segment.add_transition(transition_type, duration=transition_duration)
-                    logger.info(f"Added transition '{transition_name}' with duration {transition_duration}us")
-                except Exception as e:
-                    logger.warning(f"Failed to add transition '{transition_name}': {str(e)}")
+                video_segment.add_transition(transition_type, duration=transition_duration)
+                logger.info(f"Added transition '{transition_name}' with duration {transition_duration}us")
             else:
-                logger.warning(f"Transition type not found for name: {transition_name}")
+                raise CustomException(
+                    CustomError.VIDEO_ADD_FAILED,
+                    f"Transition type not found: {transition_name}",
+                )
 
         # 7. 向指定轨道添加片段
         script.add_segment(video_segment, track_name)
@@ -482,7 +515,7 @@ def add_video_to_draft(
         segment_info = SegmentInfo(
             id=video_segment.segment_id,
             start=video['start'],
-            end=video['end'],
+            end=video['start'] + actual_duration,
         )
 
         return video_segment.segment_id, segment_info, actual_duration
@@ -597,7 +630,32 @@ def parse_video_data(json_str: str) -> List[Dict[str, Any]]:
             "transition": item.get("transition", None),  # 默认值 None
             "transition_duration": item.get("transition_duration", None),  # 默认用转场类型自身时长
             "volume": 1.0 if item.get("volume") is None else item.get("volume"),
+            "source_start": int(item.get("source_start", 0)),
+            "source_end": (
+                int(item["source_end"]) if item.get("source_end") is not None else None
+            ),
+            "playback_rate": (
+                float(item["playback_rate"])
+                if item.get("playback_rate") is not None
+                else None
+            ),
+            "alpha": item.get("alpha"),
+            "scale_x": item.get("scale_x"),
+            "scale_y": item.get("scale_y"),
+            "transform_x": item.get("transform_x"),
+            "transform_y": item.get("transform_y"),
+            "rotation_degrees": item.get("rotation_degrees", 0.0),
         }
+
+        if processed_item["source_start"] < 0:
+            raise CustomException(CustomError.INVALID_VIDEO_INFO, f"the {i}th item has invalid source_start")
+        if (
+            processed_item["source_end"] is not None
+            and processed_item["source_end"] <= processed_item["source_start"]
+        ):
+            raise CustomException(CustomError.INVALID_VIDEO_INFO, f"the {i}th item has invalid source_end")
+        if processed_item["playback_rate"] is not None and processed_item["playback_rate"] <= 0:
+            raise CustomException(CustomError.INVALID_VIDEO_INFO, f"the {i}th item has invalid playback_rate")
         
         # 验证数值范围：用户传入范围 [0, 10]，超范围时给默认值
         if processed_item["volume"] < 0 or processed_item["volume"] > 10:

@@ -14,7 +14,7 @@
 from src.utils.logger import logger
 from src.pyJianYingDraft import ScriptFile, trange, AudioSceneEffectType, VideoSceneEffectType, VideoCharacterEffectType
 import src.pyJianYingDraft as draft
-from src.pyJianYingDraft.local_materials import AudioMaterial
+from src.pyJianYingDraft.local_materials import AudioMaterial, CapCutAudioResourceMaterial
 from src.utils.draft_cache import DRAFT_CACHE
 from exceptions import CustomException, CustomError
 import os
@@ -60,7 +60,8 @@ def _prepare_audios_local_files(draft_url: str, audio_infos: str) -> List[Dict[s
     audios = parse_audio_data(json_str=audio_infos)
     validate_audio_data(audios, draft_id)
     for audio in audios:
-        audio["local_audio_path"] = download_audio_file(audio, draft_audio_dir)
+        if not is_capcut_resource_audio(audio):
+            audio["local_audio_path"] = download_audio_file(audio, draft_audio_dir)
     return audios
 
 
@@ -337,29 +338,55 @@ def add_audio_to_draft(
         CustomException: 添加音频失败
     """
     try:
-        audio_path = audio.get("local_audio_path")
-        if audio_path:
-            if not os.path.isfile(audio_path):
-                raise CustomException(
-                    CustomError.AUDIO_ADD_FAILED,
-                    f"Missing local file: {audio_path}",
-                )
-            logger.info(f"Using local audio: {audio_path}")
+        if is_capcut_resource_audio(audio):
+            actual_duration = audio["duration"]
+            audio_material = CapCutAudioResourceMaterial(
+                resource_id=audio["resource_id"],
+                duration=actual_duration,
+                resource_kind=audio["resource_kind"],
+                material_name=audio.get("resource_name"),
+                resource_metadata=audio.get("resource_metadata"),
+            )
+            logger.info(
+                f"Using CapCut audio resource: kind={audio['resource_kind']}, "
+                f"resource_id={audio['resource_id']}"
+            )
         else:
-            audio_path = download_audio_file(audio, draft_audio_dir)
-        actual_duration = get_audio_actual_duration(audio_path)
+            audio_path = audio.get("local_audio_path")
+            if audio_path:
+                if not os.path.isfile(audio_path):
+                    raise CustomException(
+                        CustomError.AUDIO_ADD_FAILED,
+                        f"Missing local file: {audio_path}",
+                    )
+                logger.info(f"Using local audio: {audio_path}")
+            else:
+                audio_path = download_audio_file(audio, draft_audio_dir)
+            actual_duration = get_audio_actual_duration(audio_path)
+            audio_material = audio_path
         
-        # 2. 处理音频时长参数
         process_audio_duration(audio, actual_duration)
-        
-        # 3. 计算并调整音频片段时间范围
-        start_time, end_time, segment_duration = calculate_adjusted_time_range(audio, actual_duration)
-        
-        # 4. 更新音频对象中的时间参数
-        update_audio_time_params(audio, start_time, end_time)
+        start_time = audio["start"]
+        segment_duration = audio["end"] - start_time
+        source_start = audio.get("source_start", 0)
+        source_end = audio.get("source_end")
+        if source_end is None:
+            source_end = source_start + segment_duration
+        if source_start < 0 or source_end <= source_start or source_end > actual_duration:
+            raise CustomException(
+                CustomError.AUDIO_ADD_FAILED,
+                f"Invalid source range: {source_start}-{source_end}",
+            )
         
         # 5. 创建音频片段
-        audio_segment = create_audio_segment(audio_path, start_time, segment_duration, audio)
+        audio_segment = create_audio_segment(
+            audio_material,
+            start_time,
+            segment_duration,
+            audio,
+            source_start=source_start,
+            source_end=source_end,
+        )
         
         # 6. 添加音频效果（如果指定了）
         if audio.get('audio_effect'):
@@ -368,8 +395,7 @@ def add_audio_to_draft(
         logger.info(f"Created audio segment, material_id: {audio_segment.material_instance.material_id}")
         logger.info(f"Audio segment details - start: {start_time}, duration: {segment_duration}, volume: {audio['volume']}")
         
-        # 7. 添加片段到轨道（带重叠处理）
-        add_segment_with_overlap_handling(script, track_name, audio_segment, audio_path, start_time, segment_duration, audio)
+        script.add_segment(audio_segment, track_name)
         
         return audio_segment.material_instance.material_id
         
@@ -445,13 +471,29 @@ def update_audio_time_params(audio: dict, start_time: int, end_time: int):
     audio['end'] = end_time
 
 
-def create_audio_segment(audio_path: str, start_time: int, segment_duration: int, audio: dict):
+def create_audio_segment(
+    audio_material: Any,
+    start_time: int,
+    segment_duration: int,
+    audio: dict,
+    source_start: int = 0,
+    source_end: Optional[int] = None,
+):
     """创建音频片段对象"""
+    if source_end is None:
+        source_end = source_start + segment_duration
     audio_segment = draft.AudioSegment(
-        material=audio_path,
+        material=audio_material,
         target_timerange=trange(start=start_time, duration=segment_duration),
-        volume=audio['volume']
+        source_timerange=trange(start=source_start, duration=source_end - source_start),
+        volume=audio['volume'],
     )
+    fade_in = audio.get("fade_in_duration", 0)
+    fade_out = audio.get("fade_out_duration", 0)
+    if fade_in or fade_out:
+        if fade_in + fade_out > segment_duration:
+            raise CustomException(CustomError.AUDIO_ADD_FAILED, "Audio fades exceed segment duration")
+        audio_segment.add_fade(fade_in, fade_out)
     return audio_segment
 
 
@@ -575,23 +617,50 @@ def validate_item_type(item: Any, index: int):
 
 def validate_required_fields(item: Dict[str, Any], index: int):
     """验证必选字段"""
-    required_fields = ["audio_url", "start", "end"]
+    if item.get("resource_metadata") is not None and not isinstance(item["resource_metadata"], dict):
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid resource_metadata")
+
+    required_fields = ["start", "end"]
     missing_fields = [field for field in required_fields if field not in item]
     
     if missing_fields:
         logger.error(f"The {index}th item is missing required fields: {', '.join(missing_fields)}")
         raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item is missing required fields: {', '.join(missing_fields)}")
 
+    resource_id, _ = resolve_capcut_audio_resource(item)
+    source_type = item.get("source_type")
+    resource_mode = source_type in ("capcut_resource", "jianying_resource") or resource_id is not None
+    if resource_mode:
+        if resource_id is None:
+            raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item is missing resource_id")
+        return
+
+    audio_url = item.get("audio_url")
+    if not isinstance(audio_url, str) or not audio_url.startswith(("http://", "https://")):
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid audio_url")
+
 
 def create_processed_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """创建处理后的音频项，设置默认值"""
+    resource_id, resource_kind = resolve_capcut_audio_resource(item)
+    resource_metadata = item.get("resource_metadata") or {}
+    resource_mode = resource_id is not None or item.get("source_type") in ("capcut_resource", "jianying_resource")
     return {
-        "audio_url": item["audio_url"],
-        "duration": item.get("duration"),  # duration变为可选字段
+        "source_type": "capcut_resource" if resource_mode else "url",
+        "audio_url": item.get("audio_url"),
+        "resource_id": resource_id,
+        "resource_kind": resource_kind,
+        "resource_name": item.get("resource_name") or resource_metadata.get("name"),
+        "resource_metadata": resource_metadata,
+        "duration": item.get("duration", resource_metadata.get("duration")),
         "start": item["start"],
         "end": item["end"],
         "volume": item.get("volume", 1.0),  # 默认音量 1.0
-        "audio_effect": item.get("audio_effect", None)  # 默认无音频效果
+        "audio_effect": item.get("audio_effect", None),  # 默认无音频效果
+        "source_start": item.get("source_start", 0),
+        "source_end": item.get("source_end"),
+        "fade_in_duration": item.get("fade_in_duration", 0),
+        "fade_out_duration": item.get("fade_out_duration", 0),
     }
 
 
@@ -612,14 +681,65 @@ def validate_numeric_ranges(processed_item: Dict[str, Any], index: int):
     # 将时间转换为整数（微秒），兼容 start/end 为小数的情况
     processed_item["start"] = int(processed_item["start"])
     processed_item["end"] = int(processed_item["end"])
+    processed_item["source_start"] = int(processed_item["source_start"])
+    if processed_item["source_end"] is not None:
+        processed_item["source_end"] = int(processed_item["source_end"])
+    processed_item["fade_in_duration"] = int(processed_item["fade_in_duration"])
+    processed_item["fade_out_duration"] = int(processed_item["fade_out_duration"])
     if processed_item["end"] <= processed_item["start"]:
         logger.error(
             f"the {index}th item has invalid end time after int conversion: "
             f"start={processed_item['start']}, end={processed_item['end']}"
         )
         raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid end time")
+
+    if processed_item["source_start"] < 0:
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid source_start")
+    if (
+        processed_item["source_end"] is not None
+        and processed_item["source_end"] <= processed_item["source_start"]
+    ):
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid source_end")
+    if processed_item["fade_in_duration"] < 0 or processed_item["fade_out_duration"] < 0:
+        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid fade duration")
     
     # 如果提供了 duration 且小于等于 0，则报错
-    if processed_item["duration"] is not None and processed_item["duration"] <= 0:
-        logger.error(f"Invalid duration: {processed_item['duration']}")
-        raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid duration")
+    if processed_item["duration"] is not None:
+        if not isinstance(processed_item["duration"], (int, float)) or processed_item["duration"] <= 0:
+            logger.error(f"Invalid duration: {processed_item['duration']}")
+            raise CustomException(CustomError.INVALID_AUDIO_INFO, f"the {index}th item has invalid duration")
+        processed_item["duration"] = int(processed_item["duration"])
+    elif is_capcut_resource_audio(processed_item):
+        raise CustomException(
+            CustomError.INVALID_AUDIO_INFO,
+            f"the {index}th CapCut resource is missing duration",
+        )
+
+
+def resolve_capcut_audio_resource(item: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """解析资源 ID，并将各种兼容写法归一化。"""
+    metadata = item.get("resource_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    music_id = item.get("music_id") or metadata.get("music_id")
+    effect_id = item.get("effect_id") or metadata.get("effect_id")
+    resource_id = item.get("resource_id") or music_id or effect_id or metadata.get("resource_id")
+
+    kind = item.get("resource_kind")
+    if kind in ("sound", "sfx", "effect", "audio_effect"):
+        kind = "sound_effect"
+    elif kind not in ("music", "sound_effect"):
+        metadata_type = metadata.get("type")
+        kind = "sound_effect" if effect_id or metadata_type in ("sound", "sound_effect") else "music"
+
+    if isinstance(resource_id, str):
+        resource_id = resource_id.strip() or None
+    else:
+        resource_id = None
+    return resource_id, kind
+
+
+def is_capcut_resource_audio(audio: Dict[str, Any]) -> bool:
+    """判断解析后的音频是否引用剪映/CapCut 内置资源。"""
+    return audio.get("source_type") == "capcut_resource" or bool(audio.get("resource_id"))

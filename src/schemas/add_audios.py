@@ -10,8 +10,8 @@ class AddAudiosRequest(BaseModel):
 
     @field_validator("audio_infos")
     @classmethod
-    def validate_audio_infos_http_urls(cls, value: str) -> str:
-        """在 schema 层校验 audio_url 必须为 http/https。"""
+    def validate_audio_infos_sources(cls, value: str) -> str:
+        """支持 HTTP 音频和剪映/CapCut 内置资源 ID 两种来源。"""
         try:
             data = json.loads(value)
         except json.JSONDecodeError as exc:
@@ -23,8 +23,30 @@ class AddAudiosRequest(BaseModel):
         for idx, item in enumerate(data):
             if not isinstance(item, dict):
                 raise ValueError(f"audio_infos[{idx}] should be an object")
+
             audio_url = item.get("audio_url")
-            if not isinstance(audio_url, str) or not audio_url.startswith(("http://", "https://")):
+            metadata = item.get("resource_metadata")
+            if metadata is not None and not isinstance(metadata, dict):
+                raise ValueError(f"audio_infos[{idx}].resource_metadata should be an object")
+            metadata = metadata or {}
+            resource_id = (
+                item.get("resource_id")
+                or item.get("music_id")
+                or item.get("effect_id")
+                or metadata.get("music_id")
+                or metadata.get("effect_id")
+                or metadata.get("resource_id")
+            )
+            source_type = item.get("source_type")
+            resource_mode = source_type in ("capcut_resource", "jianying_resource") or bool(resource_id)
+
+            if resource_mode:
+                if not isinstance(resource_id, str) or not resource_id.strip():
+                    raise ValueError(f"audio_infos[{idx}].resource_id is required")
+                duration = item.get("duration", metadata.get("duration"))
+                if not isinstance(duration, (int, float)) or duration <= 0:
+                    raise ValueError(f"audio_infos[{idx}].duration must be greater than 0")
+            elif not isinstance(audio_url, str) or not audio_url.startswith(("http://", "https://")):
                 raise ValueError(f"audio_infos[{idx}].audio_url must start with http:// or https://")
         return value
 

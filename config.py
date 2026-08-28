@@ -14,6 +14,9 @@ LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 # 临时文件目录
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
 
+# 本地部署地址。云端部署时通过 SERVER_BASE_URL 覆盖，不再默认依赖作者官网。
+SERVER_BASE_URL = os.getenv("SERVER_BASE_URL", "http://127.0.0.1:30000").rstrip("/")
+
 # 视频生成任务完成结果（SQLite 持久化）
 VIDEO_GEN_TASK_DB_PATH = os.path.join(PROJECT_ROOT, "db", "video_gen_tasks.sqlite3")
 
@@ -21,13 +24,16 @@ VIDEO_GEN_TASK_DB_PATH = os.path.join(PROJECT_ROOT, "db", "video_gen_tasks.sqlit
 VIDEO_GEN_RETENTION_DAYS = max(1, int(os.getenv("VIDEO_GEN_RETENTION_DAYS", "7")))
 
 # 剪映草稿的下载路径
-DRAFT_URL = os.getenv("DRAFT_URL", "https://capcut-mate.jcaigc.cn/openapi/capcut-mate/v1/get_draft")
+DRAFT_URL = os.getenv(
+    "DRAFT_URL",
+    f"{SERVER_BASE_URL}/openapi/capcut-mate/v1/get_draft",
+)
 
-# 将容器内的文件路径转成一个下载路径，执行替换操作，即将/app/ -> https://capcut-mate.jcaigc.cn/
-DOWNLOAD_URL = os.getenv("DOWNLOAD_URL", "https://capcut-mate.jcaigc.cn/")
+# 本地文件的 HTTP 下载地址前缀
+DOWNLOAD_URL = os.getenv("DOWNLOAD_URL", SERVER_BASE_URL)
 
 # 草稿提示URL
-TIP_URL = os.getenv("TIP_URL", "https://docs.jcaigc.cn/")
+TIP_URL = os.getenv("TIP_URL", f"{SERVER_BASE_URL}/docs")
 
 # 贴纸配置文件路径
 STICKER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "sticker.json")
@@ -39,8 +45,19 @@ HUAZI_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "huazi.jso
 TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "template")
 
 # 剪映草稿保存路径（下载剪映草稿保存位置）-- 云渲染必需配置
-#DRAFT_SAVE_PATH = "C:/Users/Administrator/AppData/Local/JianyingPro/User Data/Projects/com.lveditor.draft"
-DRAFT_SAVE_PATH = "C:/Users/1/AppData/Local/JianyingPro/User Data/Projects/com.lveditor.draft"
+_local_app_data = os.getenv("LOCALAPPDATA", "")
+_default_draft_save_path = (
+    os.path.join(
+        _local_app_data,
+        "JianyingPro",
+        "User Data",
+        "Projects",
+        "com.lveditor.draft",
+    )
+    if _local_app_data
+    else os.path.join(PROJECT_ROOT, "output", "jianying_drafts")
+)
+DRAFT_SAVE_PATH = os.getenv("DRAFT_SAVE_PATH", _default_draft_save_path)
 
 # 腾讯云对象存储配置（优先）
 COS_SECRET_ID = os.getenv("COS_SECRET_ID", "")
@@ -76,8 +93,8 @@ TOS_ENDPOINT = os.getenv("TOS_ENDPOINT", "")
 #   /capcut-mate/     -> capcut-mate/2026-06-15/video.mp4（与上相同）
 STORAGE_UPLOAD_PREFIX = os.getenv("STORAGE_UPLOAD_PREFIX", "")
 
-# APIKEY启用配置-默认启用 -- 云渲染必需配置（环境变量 true / false，大小写不敏感）
-ENABLE_APIKEY = os.getenv("ENABLE_APIKEY", "true").strip().lower() == "true"
+# 官网计费开关；本地部署默认关闭，托管运营时显式设为 true。
+ENABLE_APIKEY = os.getenv("ENABLE_APIKEY", "false").strip().lower() == "true"
 
 # 文件下载大小限制（字节），默认200MB
 DOWNLOAD_FILE_SIZE_LIMIT = int(os.getenv("DOWNLOAD_FILE_SIZE_LIMIT", str(200 * 1024 * 1024)))

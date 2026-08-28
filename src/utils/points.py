@@ -1,4 +1,5 @@
 from typing import Dict, Any, Optional
+import os
 import time
 
 from exceptions import CustomException, CustomError
@@ -6,7 +7,10 @@ from src.utils.logger import logger
 import requests
 
 # 常量定义
-POINTS_API_BASE_URL = "https://jcaigc.cn/openapi/v1/user/points"
+POINTS_API_BASE_URL = os.getenv(
+    "POINTS_API_BASE_URL",
+    "https://jcaigc.cn/openapi/v1/user/points",
+)
 API_HEADERS = {
     'User-Agent': 'CapcutMate/1.0',
     'Accept': 'application/json',

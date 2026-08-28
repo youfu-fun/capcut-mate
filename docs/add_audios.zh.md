@@ -13,6 +13,8 @@ POST /openapi/capcut-mate/v1/add_audios
 
 批量向现有草稿中添加音频素材。该接口支持添加多个音频文件到剪映草稿，为视频创建背景音乐、音效、旁白等音频内容。音频将被添加到独立的音频轨道中，不会影响视频内容。
 
+除实体音频 URL 外，接口也支持直接引用剪映内置 BGM/音效资源 ID，详见 [CapCut/剪映内置音频资源 ID](./capcut_audio_resource_ids.zh.md)。
+
 ## 更多文档
 
 📖 更多详细文档和教程请访问：[https://docs.jcaigc.cn](https://docs.jcaigc.cn)

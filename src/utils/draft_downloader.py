@@ -154,7 +154,11 @@ def verify_local_draft_ready(draft_id: str, save_path: Optional[str] = None) -> 
     return DraftDownloadResult(ok=True)
 
 
-def _localize_draft_meta_info(target_dir: str, draft_id: str) -> None:
+def _localize_draft_meta_info(
+    target_dir: str,
+    draft_id: str,
+    draft_root: Optional[str] = None,
+) -> None:
     """
     将 draft_meta_info.json 中的名称与路径改写为本地草稿目录。
 
@@ -178,7 +182,7 @@ def _localize_draft_meta_info(target_dir: str, draft_id: str) -> None:
                 url=meta_path,
             )
 
-        root_path = os.path.normpath(config.DRAFT_SAVE_PATH)
+        root_path = os.path.normpath(draft_root or config.DRAFT_SAVE_PATH)
         fold_path = os.path.normpath(target_dir)
         old_name = meta.get("draft_name")
         meta["draft_name"] = draft_id
@@ -595,6 +599,96 @@ def extract_draft_id_from_url(url: str) -> Optional[str]:
         return None
 
 
+def _rewrite_copied_draft_paths(
+    source_dir: str,
+    target_dir: str,
+    draft_id: str,
+) -> None:
+    """将项目输出目录中的素材路径改成剪映草稿目录中的对应路径。"""
+    content_path = os.path.join(target_dir, "draft_content.json")
+    if not os.path.isfile(content_path):
+        _abort(
+            DraftDownloadFailureKind.RESOURCE_UNAVAILABLE,
+            detail="draft_content.json missing in local draft",
+            url=content_path,
+        )
+
+    try:
+        with open(content_path, "r", encoding="utf-8") as f:
+            content = json.load(f)
+
+        target_prefix = os.path.normpath(target_dir) + os.sep
+        source_prefixes = {
+            os.path.normpath(source_dir) + os.sep,
+            source_dir.replace("\\", "/").rstrip("/") + "/",
+            f"/app/output/draft/{draft_id}/",
+        }
+        for source_prefix in source_prefixes:
+            content = update_material_paths(content, source_prefix, target_prefix)
+
+        _localize_remote_material_paths(content, target_dir)
+
+        json_content = json.dumps(content, ensure_ascii=False, indent=2)
+        try:
+            os.remove(content_path)
+        except OSError:
+            pass
+        safe_write_file(content_path, json_content, is_binary=False)
+        if not _sync_draft_info_from_content(target_dir):
+            _abort(
+                DraftDownloadFailureKind.LOCAL_IO,
+                detail="Failed to sync draft_info.json from local draft",
+                url=content_path,
+            )
+    except DraftDownloadAbort:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        _abort(
+            DraftDownloadFailureKind.LOCAL_IO,
+            detail=f"Failed to localize copied draft: {exc}",
+            url=content_path,
+        )
+
+
+def _copy_local_draft_to_jianying(
+    source_dir: str,
+    save_path: str,
+    draft_id: str,
+) -> DraftDownloadResult:
+    """本机部署时直接复制草稿到剪映目录，跳过 HTTP 下载。"""
+    source_dir = os.path.abspath(source_dir)
+    target_dir = os.path.abspath(os.path.join(save_path, draft_id))
+    dequeue_path(target_dir)
+
+    try:
+        if os.path.normcase(source_dir) != os.path.normcase(target_dir):
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
+            os.makedirs(save_path, exist_ok=True)
+            shutil.copytree(source_dir, target_dir)
+
+        _rewrite_copied_draft_paths(source_dir, target_dir, draft_id)
+        _localize_draft_meta_info(target_dir, draft_id, draft_root=save_path)
+        trigger_directory_scan_with_robocopy(target_dir)
+        logger.info(
+            "Local draft copied directly into Jianying: draft_id=%s source=%s target=%s",
+            draft_id,
+            source_dir,
+            target_dir,
+        )
+        return verify_local_draft_ready(draft_id, save_path=save_path)
+    except DraftDownloadAbort as exc:
+        return _result_from_abort(exc)
+    except OSError as exc:
+        logger.error("Local draft copy failed: %s", exc)
+        return DraftDownloadResult(
+            ok=False,
+            kind=DraftDownloadFailureKind.LOCAL_IO,
+            detail=str(exc),
+            url=target_dir,
+        )
+
+
 def download_draft(draft_url: str, save_path: Optional[str] = None) -> bool:
     """
     下载草稿文件到指定目录
@@ -630,6 +724,15 @@ def download_draft_with_result(
 
     if save_path is None:
         save_path = config.DRAFT_SAVE_PATH
+
+    # 本机生成的草稿直接放入剪映目录，不再访问 get_draft 或作者云端。
+    local_source_dir = os.path.join(config.DRAFT_DIR, draft_id)
+    if os.path.isdir(local_source_dir):
+        return _copy_local_draft_to_jianying(
+            local_source_dir,
+            save_path,
+            draft_id,
+        )
 
     target_dir = prepare_target_directory(save_path, draft_id)
     dequeue_path(target_dir)
@@ -1947,5 +2050,3 @@ def finalize_batch_results(results: dict, draft_urls: list) -> None:
     logger.info(
         f"Batch download finished: total={total}, ok={success_count}, failed={failure_count}"
     )
-
-

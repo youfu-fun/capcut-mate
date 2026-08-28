@@ -1,7 +1,7 @@
 import warnings
 import sys
 
-from .local_materials import CropSettings, VideoMaterial, AudioMaterial
+from .local_materials import CropSettings, VideoMaterial, AudioMaterial, CapCutAudioResourceMaterial
 from .keyframe import KeyframeProperty
 
 from .time_util import Timerange
@@ -215,6 +215,7 @@ __all__ = [
     "CropSettings",
     "VideoMaterial",
     "AudioMaterial",
+    "CapCutAudioResourceMaterial",
     "KeyframeProperty",
     "Timerange",
     "AudioSegment",
