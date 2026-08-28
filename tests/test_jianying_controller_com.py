@@ -11,6 +11,7 @@ sys.modules.setdefault("src.utils.logger", _logger_module)
 
 import _ctypes
 import pytest
+from PIL import Image, ImageDraw
 
 if not hasattr(_ctypes, "COMError"):
     class _TestCOMError(Exception):
@@ -146,6 +147,18 @@ class TestJianying59AudioDownloadRetry:
 
         assert JianyingController._audio_download_retry_cmp(control, 3) is False
 
+    def test_finds_retry_icons_in_self_drawn_timeline(self) -> None:
+        image = Image.new("RGB", (1000, 600), (20, 24, 30))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((80, 260, 900, 330), fill=(8, 29, 49))
+        draw.rectangle((350, 360, 650, 430), fill=(24, 39, 53))
+        draw.ellipse((100, 280, 124, 304), outline=(220, 35, 35), width=5)
+        draw.ellipse((370, 380, 394, 404), outline=(220, 35, 35), width=5)
+
+        points = JianyingController._find_visual_audio_retry_points(image)
+
+        assert points == [(112, 292), (382, 392)]
+
     def test_retries_each_failed_audio_until_all_recover(self) -> None:
         ctrl = JianyingController.__new__(JianyingController)
         ctrl.app_status = "edit"
@@ -156,6 +169,11 @@ class TestJianying59AudioDownloadRetry:
                 ctrl,
                 "_find_audio_download_retry_control",
                 side_effect=[failed_audio, failed_audio, None],
+            ),
+            patch.object(
+                ctrl,
+                "_find_visual_audio_retry_points_on_screen",
+                return_value=[],
             ),
             patch.object(ctrl, "_safe_click") as safe_click,
             patch.object(ctrl, "get_window"),

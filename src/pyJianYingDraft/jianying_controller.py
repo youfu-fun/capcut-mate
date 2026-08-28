@@ -296,6 +296,106 @@ class JianyingController:
             raise AutomationError("audio download retry control not found")
         return control
 
+    @staticmethod
+    def _find_visual_audio_retry_points(screenshot) -> list[tuple[int, int]]:
+        """从剪映 5.9 时间轴截图中定位红色的音频下载重试图标。
+
+        5.9 的时间轴由 Qt/QML 自绘，失败文案不会进入 UIA 控件树。重试图标
+        是稳定的红色圆环，且位于深色轨道内；这里按颜色、尺寸、形状和上下
+        背景联合过滤，避免把视频缩略图里的红色内容当成按钮。
+        """
+        image = screenshot.convert("RGB")
+        original_width, original_height = image.size
+        if original_width <= 0 or original_height <= 0:
+            return []
+
+        # 限制扫描宽度，兼顾 2K/4K 屏幕上的速度和图标识别精度。
+        scale = min(1.0, 1600.0 / original_width)
+        if scale < 1.0:
+            image = image.resize(
+                (
+                    max(1, int(original_width * scale)),
+                    max(1, int(original_height * scale)),
+                )
+            )
+
+        width, height = image.size
+        pixels = image.load()
+        red_pixels: set[tuple[int, int]] = set()
+
+        # 时间轴位于编辑窗口下半部分；排除顶部工具栏和窗口边缘。
+        for y in range(int(height * 0.35), max(int(height * 0.35), height - 8)):
+            for x in range(int(width * 0.05), max(int(width * 0.05), width - 8)):
+                red, green, blue = pixels[x, y]
+                if (
+                    red >= 145
+                    and green <= 115
+                    and blue <= 115
+                    and red - green >= 55
+                    and red - blue >= 45
+                ):
+                    red_pixels.add((x, y))
+
+        candidates: list[tuple[int, int]] = []
+        while red_pixels:
+            seed = red_pixels.pop()
+            queue = [seed]
+            xs = [seed[0]]
+            ys = [seed[1]]
+            for x, y in queue:
+                for next_x in (x - 1, x, x + 1):
+                    for next_y in (y - 1, y, y + 1):
+                        point = (next_x, next_y)
+                        if point in red_pixels:
+                            red_pixels.remove(point)
+                            queue.append(point)
+                            xs.append(next_x)
+                            ys.append(next_y)
+
+            left, right = min(xs), max(xs)
+            top, bottom = min(ys), max(ys)
+            component_width = right - left + 1
+            component_height = bottom - top + 1
+            area = len(xs)
+            aspect_ratio = component_width / component_height
+            if not (
+                6 <= component_width <= 40
+                and 6 <= component_height <= 40
+                and 0.65 <= aspect_ratio <= 1.45
+                and area >= 12
+                and area >= component_width * component_height * 0.18
+            ):
+                continue
+
+            center_x = (left + right) // 2
+            center_y = (top + bottom) // 2
+            outside_offset = component_height // 2 + 4
+            above_y = max(0, center_y - outside_offset)
+            below_y = min(height - 1, center_y + outside_offset)
+            above = pixels[center_x, above_y]
+            below = pixels[center_x, below_y]
+            if max(above) > 140 or max(below) > 140:
+                continue
+
+            candidates.append(
+                (
+                    int(round(center_x / scale)),
+                    int(round(center_y / scale)),
+                )
+            )
+
+        return sorted(candidates, key=lambda point: (point[1], point[0]))
+
+    def _find_visual_audio_retry_points_on_screen(self) -> list[tuple[int, int]]:
+        try:
+            return self._find_visual_audio_retry_points(pyautogui.screenshot())
+        except Exception as exc:
+            logger.warning(
+                "Unable to inspect Jianying timeline screenshot for audio retry: %r",
+                exc,
+            )
+            return []
+
     def retry_failed_audio_downloads(self) -> None:
         """剪映 5.9 打开草稿后，自动重试内置 BGM/音效的首次下载。
 
@@ -304,7 +404,13 @@ class JianyingController:
         """
         saw_failure = False
         for attempt in range(1, AUDIO_DOWNLOAD_MAX_RETRIES + 1):
-            if self._find_audio_download_retry_control() is None:
+            retry_control = self._find_audio_download_retry_control()
+            visual_points = (
+                []
+                if retry_control is not None
+                else self._find_visual_audio_retry_points_on_screen()
+            )
+            if retry_control is None and not visual_points:
                 if saw_failure:
                     logger.info("Jianying audio resource download recovered")
                     time.sleep(2)
@@ -316,16 +422,28 @@ class JianyingController:
                 attempt,
                 AUDIO_DOWNLOAD_MAX_RETRIES,
             )
-            self._safe_click(
-                self._require_audio_download_retry_control,
-                f"retry_failed_audio_downloads[{attempt}]",
-            )
+            if retry_control is not None:
+                self._safe_click(
+                    self._require_audio_download_retry_control,
+                    f"retry_failed_audio_downloads[{attempt}]",
+                )
+            else:
+                logger.info(
+                    "Found %d Jianying audio retry icon(s) visually",
+                    len(visual_points),
+                )
+                for point in visual_points:
+                    pyautogui.click(*point)
+                    time.sleep(0.5)
             time.sleep(AUDIO_DOWNLOAD_RETRY_INTERVAL)
             self.get_window()
             if self.app_status != "edit":
                 raise AutomationError("重试音频下载后剪映离开了编辑页面")
 
-        if self._find_audio_download_retry_control() is not None:
+        if (
+            self._find_audio_download_retry_control() is not None
+            or self._find_visual_audio_retry_points_on_screen()
+        ):
             raise AutomationError(
                 "剪映内置音频下载持续失败，已停止导出，请检查网络或音频资源 ID"
             )
