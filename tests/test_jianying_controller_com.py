@@ -5,16 +5,30 @@ from unittest.mock import MagicMock, PropertyMock, patch
 # jianying_controller 在导入时会加载 Windows 专用依赖，测试环境用 mock 占位
 sys.modules.setdefault("uiautomation", MagicMock())
 sys.modules.setdefault("pyautogui", MagicMock())
+_logger_module = MagicMock()
+_logger_module.logger = MagicMock()
+sys.modules.setdefault("src.utils.logger", _logger_module)
 
 import _ctypes
 import pytest
 
-from src.pyJianYingDraft.jianying_controller import (
-    COM_UIA_ERROR_HRESULT,
-    COM_UIA_ERROR_MARKER,
-    JianyingController,
-    is_com_uia_error,
-)
+if not hasattr(_ctypes, "COMError"):
+    class _TestCOMError(Exception):
+        pass
+
+    _ctypes.COMError = _TestCOMError  # type: ignore[attr-defined]
+
+_original_platform = sys.platform
+try:
+    sys.platform = "win32"
+    from src.pyJianYingDraft.jianying_controller import (
+        COM_UIA_ERROR_HRESULT,
+        COM_UIA_ERROR_MARKER,
+        JianyingController,
+        is_com_uia_error,
+    )
+finally:
+    sys.platform = _original_platform
 
 
 class TestIsComUiaError:
@@ -105,3 +119,66 @@ class TestExistsWithComRetry:
             )
 
         assert control.Exists.call_count == 2
+
+
+class TestJianying59AudioDownloadRetry:
+    def test_matches_audio_download_failure_text(self) -> None:
+        control = type(
+            "FakeControl",
+            (),
+            {
+                "Name": "音乐下载失败，点击重试",
+                "GetPropertyValue": lambda self, _property_id: "",
+            },
+        )()
+
+        assert JianyingController._audio_download_retry_cmp(control, 3) is True
+
+    def test_ignores_unrelated_retry_text(self) -> None:
+        control = type(
+            "FakeControl",
+            (),
+            {
+                "Name": "导出失败",
+                "GetPropertyValue": lambda self, _property_id: "",
+            },
+        )()
+
+        assert JianyingController._audio_download_retry_cmp(control, 3) is False
+
+    def test_retries_each_failed_audio_until_all_recover(self) -> None:
+        ctrl = JianyingController.__new__(JianyingController)
+        ctrl.app_status = "edit"
+        failed_audio = MagicMock()
+
+        with (
+            patch.object(
+                ctrl,
+                "_find_audio_download_retry_control",
+                side_effect=[failed_audio, failed_audio, None],
+            ),
+            patch.object(ctrl, "_safe_click") as safe_click,
+            patch.object(ctrl, "get_window"),
+            patch("src.pyJianYingDraft.jianying_controller.time.sleep"),
+        ):
+            ctrl.retry_failed_audio_downloads()
+
+        assert safe_click.call_count == 2
+
+    def test_blocks_export_when_audio_download_never_recovers(self) -> None:
+        ctrl = JianyingController.__new__(JianyingController)
+        ctrl.app_status = "edit"
+        failed_audio = MagicMock()
+
+        with (
+            patch.object(
+                ctrl,
+                "_find_audio_download_retry_control",
+                return_value=failed_audio,
+            ),
+            patch.object(ctrl, "_safe_click"),
+            patch.object(ctrl, "get_window"),
+            patch("src.pyJianYingDraft.jianying_controller.time.sleep"),
+            pytest.raises(Exception, match="音频下载持续失败"),
+        ):
+            ctrl.retry_failed_audio_downloads()

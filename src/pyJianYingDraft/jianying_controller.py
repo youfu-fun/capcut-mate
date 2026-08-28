@@ -49,6 +49,8 @@ COM_E_FAIL_HRESULT = -2147467259
 COM_E_FAIL_MARKER = "未指定的错误"
 UIA_CLICK_MAX_RETRIES = 4
 UIA_CLICK_RETRY_INTERVAL = 1.0
+AUDIO_DOWNLOAD_MAX_RETRIES = 4
+AUDIO_DOWNLOAD_RETRY_INTERVAL = 5.0
 
 
 def is_com_uia_error(exc: BaseException) -> bool:
@@ -249,6 +251,84 @@ class JianyingController:
         if last_exc is not None:
             raise last_exc
         return False
+
+    @staticmethod
+    def _audio_download_retry_cmp(control: uia.Control, depth: int) -> bool:
+        """匹配剪映 5.9 时间线上的内置音频下载失败/重试控件。"""
+        if depth < 1:
+            return False
+        try:
+            name = str(control.Name or "")
+            full_desc = str(control.GetPropertyValue(30159) or "")
+        except Exception as exc:
+            if is_com_uia_error(exc):
+                return False
+            raise
+        text = f"{name} {full_desc}".strip()
+        return (
+            (
+                ("音频下载失败" in text or "音乐下载失败" in text)
+                and "重试" in text
+            )
+            or text in ("重试", "点击重试", "重新下载")
+        )
+
+    def _make_audio_download_retry_control(self) -> uia.Control:
+        return self.app.Control(
+            searchDepth=12,
+            Compare=self._audio_download_retry_cmp,
+        )
+
+    def _find_audio_download_retry_control(self) -> Optional[uia.Control]:
+        control = self._make_audio_download_retry_control()
+        if self._exists_with_com_retry(
+            control,
+            "find_audio_download_retry_control",
+            timeout=0.5,
+            raise_on_exhausted=False,
+        ):
+            return control
+        return None
+
+    def _require_audio_download_retry_control(self) -> uia.Control:
+        control = self._find_audio_download_retry_control()
+        if control is None:
+            raise AutomationError("audio download retry control not found")
+        return control
+
+    def retry_failed_audio_downloads(self) -> None:
+        """剪映 5.9 打开草稿后，自动重试内置 BGM/音效的首次下载。
+
+        只有界面明确出现“音频下载失败/点击重试”时才操作；持续失败则阻止
+        导出，避免生成缺失 BGM 或音效的静音成片。
+        """
+        saw_failure = False
+        for attempt in range(1, AUDIO_DOWNLOAD_MAX_RETRIES + 1):
+            if self._find_audio_download_retry_control() is None:
+                if saw_failure:
+                    logger.info("Jianying audio resource download recovered")
+                    time.sleep(2)
+                return
+
+            saw_failure = True
+            logger.warning(
+                "Jianying audio resource download failed; clicking retry (%d/%d)",
+                attempt,
+                AUDIO_DOWNLOAD_MAX_RETRIES,
+            )
+            self._safe_click(
+                self._require_audio_download_retry_control,
+                f"retry_failed_audio_downloads[{attempt}]",
+            )
+            time.sleep(AUDIO_DOWNLOAD_RETRY_INTERVAL)
+            self.get_window()
+            if self.app_status != "edit":
+                raise AutomationError("重试音频下载后剪映离开了编辑页面")
+
+        if self._find_audio_download_retry_control() is not None:
+            raise AutomationError(
+                "剪映内置音频下载持续失败，已停止导出，请检查网络或音频资源 ID"
+            )
 
     def _make_export_succeed_close_btn(self, *, from_export_window: bool = False) -> uia.Control:
         root = self.app
@@ -577,6 +657,7 @@ class JianyingController:
             if self.app_status == "home":
                 logger.info("[%d]app is already in home page", i)
                 self.find_and_click_draft(draft_name, draft_dir=draft_dir)
+                self.retry_failed_audio_downloads()
             elif self.app_status == "edit":
                 if export_completed or (
                     original_path and os.path.isfile(original_path)
