@@ -1,4 +1,5 @@
 """JianyingController 对 UI Automation COM 瞬时错误的容错。"""
+import json
 import sys
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -158,6 +159,74 @@ class TestJianying59AudioDownloadRetry:
         points = JianyingController._find_visual_audio_retry_points(image)
 
         assert points == [(112, 292), (382, 392)]
+
+    def test_finds_visible_timeline_clip_centers(self) -> None:
+        image = Image.new("RGB", (1200, 800), (20, 24, 30))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((180, 450, 720, 505), fill=(20, 82, 94))
+        draw.rectangle((260, 575, 640, 625), fill=(35, 52, 76))
+
+        points = JianyingController._find_visual_timeline_clip_points(image)
+
+        assert (450, 477) in points
+        assert (450, 600) in points
+
+    def test_counts_only_native_audio_resources(self, tmp_path) -> None:
+        (tmp_path / "draft_content.json").write_text(
+            json.dumps(
+                {
+                    "materials": {
+                        "audios": [
+                            {"effect_id": "sound-1"},
+                            {"music_id": "music-1"},
+                            {"resource_id": "resource-1"},
+                            {"path": "C:/voice.mp3"},
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert JianyingController._count_native_audio_resources(str(tmp_path)) == 3
+
+    def test_scrolls_all_timeline_pages_and_restores_top(self, tmp_path) -> None:
+        (tmp_path / "draft_content.json").write_text(
+            json.dumps({"materials": {"audios": [{"effect_id": "sound-1"}]}}),
+            encoding="utf-8",
+        )
+        ctrl = JianyingController.__new__(JianyingController)
+        signature_a = bytes([10]) * (64 * 24)
+        signature_b = bytes([40]) * (64 * 24)
+
+        with (
+            patch.object(ctrl, "_scroll_timeline") as scroll_timeline,
+            patch.object(
+                ctrl,
+                "_find_visual_timeline_clip_points_on_screen",
+                return_value=[(450, 600)],
+            ),
+            patch.object(ctrl, "_retry_visible_audio_downloads") as retry_visible,
+            patch.object(
+                ctrl,
+                "_get_timeline_view_signature",
+                side_effect=[signature_a, signature_b, signature_b, signature_b],
+            ),
+            patch(
+                "src.pyJianYingDraft.jianying_controller.pyautogui.click"
+            ) as click,
+            patch("src.pyJianYingDraft.jianying_controller.time.sleep"),
+        ):
+            ctrl.retry_failed_audio_downloads(draft_dir=str(tmp_path))
+
+        assert click.call_count == 2
+        assert retry_visible.call_count == 2
+        assert [call.args[0] for call in scroll_timeline.call_args_list] == [
+            120,
+            -6,
+            -6,
+            120,
+        ]
 
     def test_retries_each_failed_audio_until_all_recover(self) -> None:
         ctrl = JianyingController.__new__(JianyingController)

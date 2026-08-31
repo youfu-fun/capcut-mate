@@ -13,6 +13,7 @@
 """剪映自动化控制，主要与自动导出有关"""
 
 import _ctypes
+import json
 import os
 import time
 import shutil
@@ -51,6 +52,11 @@ UIA_CLICK_MAX_RETRIES = 4
 UIA_CLICK_RETRY_INTERVAL = 1.0
 AUDIO_DOWNLOAD_MAX_RETRIES = 4
 AUDIO_DOWNLOAD_RETRY_INTERVAL = 5.0
+AUDIO_TIMELINE_MAX_PAGES = 12
+AUDIO_TIMELINE_SCROLL_CLICKS = 6
+AUDIO_TIMELINE_RESET_CLICKS = 120
+AUDIO_TIMELINE_SCROLL_INTERVAL = 0.8
+AUDIO_TIMELINE_ACTIVATION_INTERVAL = 1.5
 
 
 def is_com_uia_error(exc: BaseException) -> bool:
@@ -396,12 +402,177 @@ class JianyingController:
             )
             return []
 
-    def retry_failed_audio_downloads(self) -> None:
-        """剪映 5.9 打开草稿后，自动重试内置 BGM/音效的首次下载。
+    @staticmethod
+    def _count_native_audio_resources(draft_dir: Optional[str]) -> int:
+        """统计草稿中需要剪映联网加载的内置 BGM/音效数量。"""
+        if not draft_dir:
+            return 0
 
-        只有界面明确出现“音频下载失败/点击重试”时才操作；持续失败则阻止
-        导出，避免生成缺失 BGM 或音效的静音成片。
+        content_path = os.path.join(draft_dir, "draft_content.json")
+        try:
+            with open(content_path, "r", encoding="utf-8") as content_file:
+                content = json.load(content_file)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning(
+                "Unable to inspect draft native audio resources: path=%s error=%r",
+                content_path,
+                exc,
+            )
+            return 0
+
+        audios = content.get("materials", {}).get("audios", [])
+        return sum(
+            1
+            for audio in audios
+            if isinstance(audio, dict)
+            and any(
+                str(audio.get(field) or "").strip()
+                for field in ("music_id", "effect_id", "resource_id")
+            )
+        )
+
+    @staticmethod
+    def _is_timeline_clip_pixel(red: int, green: int, blue: int) -> bool:
+        """判断像素是否更像时间线片段，而不是深色空白背景。"""
+        brightest = max(red, green, blue)
+        darkest = min(red, green, blue)
+        return 32 <= brightest <= 210 and brightest - darkest >= 12
+
+    @classmethod
+    def _find_visual_timeline_clip_points(
+        cls, screenshot
+    ) -> list[tuple[int, int]]:
+        """从当前可见时间线中找出片段中心点。
+
+        剪映 5.9 的时间线由 Qt/QML 自绘，音频片段通常不进入 UIA 控件树。
+        这里按时间线中的有色横向矩形寻找片段；点击视频或字幕片段是无害的，
+        但能确保可见的内置音频片段被激活并触发首次下载。
         """
+        image = screenshot.convert("RGB")
+        original_width, original_height = image.size
+        if original_width <= 0 or original_height <= 0:
+            return []
+
+        scale = min(1.0, 1600.0 / original_width)
+        if scale < 1.0:
+            image = image.resize(
+                (
+                    max(1, int(original_width * scale)),
+                    max(1, int(original_height * scale)),
+                )
+            )
+
+        width, height = image.size
+        pixels = image.load()
+        left = int(width * 0.10)
+        right = int(width * 0.96)
+        top = int(height * 0.52)
+        bottom = int(height * 0.94)
+        min_row_pixels = max(24, int((right - left) * 0.025))
+
+        active_rows: list[int] = []
+        for y in range(top, bottom):
+            count = 0
+            for x in range(left, right):
+                if cls._is_timeline_clip_pixel(*pixels[x, y]):
+                    count += 1
+            if count >= min_row_pixels:
+                active_rows.append(y)
+
+        row_bands: list[tuple[int, int]] = []
+        for y in active_rows:
+            if not row_bands or y > row_bands[-1][1] + 2:
+                row_bands.append((y, y))
+            else:
+                row_bands[-1] = (row_bands[-1][0], y)
+
+        candidates: list[tuple[int, int]] = []
+        for band_top, band_bottom in row_bands:
+            band_height = band_bottom - band_top + 1
+            if band_height < 6 or band_height > int(height * 0.14):
+                continue
+
+            center_y = (band_top + band_bottom) // 2
+            active_columns: list[int] = []
+            required_band_pixels = max(2, int(band_height * 0.18))
+            for x in range(left, right):
+                count = 0
+                for y in range(band_top, band_bottom + 1):
+                    if cls._is_timeline_clip_pixel(*pixels[x, y]):
+                        count += 1
+                if count >= required_band_pixels:
+                    active_columns.append(x)
+
+            column_bands: list[tuple[int, int]] = []
+            for x in active_columns:
+                if not column_bands or x > column_bands[-1][1] + 5:
+                    column_bands.append((x, x))
+                else:
+                    column_bands[-1] = (column_bands[-1][0], x)
+
+            for band_left, band_right in column_bands:
+                if band_right - band_left + 1 < 24:
+                    continue
+                candidates.append(
+                    (
+                        int(round(((band_left + band_right) // 2) / scale)),
+                        int(round(center_y / scale)),
+                    )
+                )
+
+        return candidates
+
+    def _find_visual_timeline_clip_points_on_screen(
+        self,
+    ) -> list[tuple[int, int]]:
+        try:
+            return self._find_visual_timeline_clip_points(pyautogui.screenshot())
+        except Exception as exc:
+            logger.warning(
+                "Unable to inspect Jianying timeline clips: %r",
+                exc,
+            )
+            return []
+
+    @staticmethod
+    def _timeline_view_signature(screenshot) -> bytes:
+        """生成时间线视口的低分辨率签名，用于判断是否已经滚到底。"""
+        image = screenshot.convert("L")
+        width, height = image.size
+        viewport = image.crop(
+            (
+                int(width * 0.10),
+                int(height * 0.52),
+                int(width * 0.96),
+                int(height * 0.94),
+            )
+        )
+        return viewport.resize((64, 24)).tobytes()
+
+    @staticmethod
+    def _timeline_signatures_similar(first: bytes, second: bytes) -> bool:
+        if not first or len(first) != len(second):
+            return False
+        average_difference = sum(
+            abs(left - right) for left, right in zip(first, second)
+        ) / len(first)
+        return average_difference <= 1.5
+
+    def _get_timeline_view_signature(self) -> bytes:
+        try:
+            return self._timeline_view_signature(pyautogui.screenshot())
+        except Exception as exc:
+            logger.warning("Unable to snapshot Jianying timeline: %r", exc)
+            return b""
+
+    def _scroll_timeline(self, clicks: int) -> None:
+        screenshot = pyautogui.screenshot()
+        width, height = screenshot.size
+        pyautogui.moveTo(int(width * 0.72), int(height * 0.82))
+        pyautogui.scroll(clicks)
+
+    def _retry_visible_audio_downloads(self) -> bool:
+        """重试当前可见页面上的音频下载；返回是否观察到过失败。"""
         saw_failure = False
         for attempt in range(1, AUDIO_DOWNLOAD_MAX_RETRIES + 1):
             retry_control = self._find_audio_download_retry_control()
@@ -414,7 +585,7 @@ class JianyingController:
                 if saw_failure:
                     logger.info("Jianying audio resource download recovered")
                     time.sleep(2)
-                return
+                return saw_failure
 
             saw_failure = True
             logger.warning(
@@ -425,7 +596,7 @@ class JianyingController:
             if retry_control is not None:
                 self._safe_click(
                     self._require_audio_download_retry_control,
-                    f"retry_failed_audio_downloads[{attempt}]",
+                    f"retry_visible_audio_downloads[{attempt}]",
                 )
             else:
                 logger.info(
@@ -447,6 +618,69 @@ class JianyingController:
             raise AutomationError(
                 "剪映内置音频下载持续失败，已停止导出，请检查网络或音频资源 ID"
             )
+        return saw_failure
+
+    def retry_failed_audio_downloads(
+        self, draft_dir: Optional[str] = None
+    ) -> None:
+        """剪映 5.9 打开草稿后，自动重试内置 BGM/音效的首次下载。
+
+        音频轨可能隐藏在时间线下方，因此必须逐屏向下滚动：激活当前可见片段、
+        重试下载失败资源，再继续下一屏。持续失败则阻止导出，避免静音成片。
+        """
+        # 保留独立调用的兼容行为；真实导出会传入 draft_dir 并启用全轨扫描。
+        if not draft_dir:
+            self._retry_visible_audio_downloads()
+            return
+
+        native_audio_count = self._count_native_audio_resources(draft_dir)
+        if native_audio_count == 0:
+            return
+
+        logger.info(
+            "Scanning Jianying timeline for native audio resources: count=%d",
+            native_audio_count,
+        )
+
+        # 从轨道顶部开始，避免上一次手动滚动位置影响本次扫描。
+        self._scroll_timeline(AUDIO_TIMELINE_RESET_CLICKS)
+        time.sleep(AUDIO_TIMELINE_SCROLL_INTERVAL)
+        try:
+            for page in range(AUDIO_TIMELINE_MAX_PAGES):
+                clip_points = self._find_visual_timeline_clip_points_on_screen()
+                logger.info(
+                    "Activating visible Jianying timeline clips: page=%d points=%d",
+                    page + 1,
+                    len(clip_points),
+                )
+                for point in clip_points:
+                    pyautogui.click(*point)
+                    time.sleep(0.15)
+
+                if clip_points:
+                    time.sleep(AUDIO_TIMELINE_ACTIVATION_INTERVAL)
+                self._retry_visible_audio_downloads()
+
+                before_scroll = self._get_timeline_view_signature()
+                self._scroll_timeline(-AUDIO_TIMELINE_SCROLL_CLICKS)
+                time.sleep(AUDIO_TIMELINE_SCROLL_INTERVAL)
+                after_scroll = self._get_timeline_view_signature()
+                if (
+                    before_scroll
+                    and after_scroll
+                    and self._timeline_signatures_similar(
+                        before_scroll, after_scroll
+                    )
+                ):
+                    logger.info(
+                        "Reached bottom of Jianying timeline after %d page(s)",
+                        page + 1,
+                    )
+                    break
+        finally:
+            # 导出前恢复轨道顶部，保持后续界面识别的稳定性。
+            self._scroll_timeline(AUDIO_TIMELINE_RESET_CLICKS)
+            time.sleep(AUDIO_TIMELINE_SCROLL_INTERVAL)
 
     def _make_export_succeed_close_btn(self, *, from_export_window: bool = False) -> uia.Control:
         root = self.app
@@ -775,7 +1009,7 @@ class JianyingController:
             if self.app_status == "home":
                 logger.info("[%d]app is already in home page", i)
                 self.find_and_click_draft(draft_name, draft_dir=draft_dir)
-                self.retry_failed_audio_downloads()
+                self.retry_failed_audio_downloads(draft_dir=draft_dir)
             elif self.app_status == "edit":
                 if export_completed or (
                     original_path and os.path.isfile(original_path)
