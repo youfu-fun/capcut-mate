@@ -190,6 +190,53 @@ class TestJianying59AudioDownloadRetry:
 
         assert JianyingController._count_native_audio_resources(str(tmp_path)) == 3
 
+    def test_counts_native_sticker_resources(self, tmp_path) -> None:
+        (tmp_path / "draft_content.json").write_text(
+            json.dumps(
+                {
+                    "materials": {
+                        "stickers": [
+                            {"sticker_id": "sticker-1"},
+                            {"resource_id": "sticker-2"},
+                            {"path": "C:/local.png"},
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert JianyingController._count_native_sticker_resources(str(tmp_path)) == 2
+
+    def test_scans_timeline_when_draft_has_only_native_sticker(self, tmp_path) -> None:
+        (tmp_path / "draft_content.json").write_text(
+            json.dumps({"materials": {"stickers": [{"sticker_id": "sticker-1"}]}}),
+            encoding="utf-8",
+        )
+        ctrl = JianyingController.__new__(JianyingController)
+        signature = bytes([10]) * (64 * 24)
+
+        with (
+            patch.object(ctrl, "_scroll_timeline") as scroll_timeline,
+            patch.object(
+                ctrl,
+                "_find_visual_timeline_clip_points_on_screen",
+                return_value=[(450, 600)],
+            ),
+            patch.object(ctrl, "_retry_visible_audio_downloads"),
+            patch.object(
+                ctrl,
+                "_get_timeline_view_signature",
+                side_effect=[signature, signature],
+            ),
+            patch("src.pyJianYingDraft.jianying_controller.pyautogui.click") as click,
+            patch("src.pyJianYingDraft.jianying_controller.time.sleep"),
+        ):
+            ctrl.retry_failed_audio_downloads(draft_dir=str(tmp_path))
+
+        assert click.call_count == 1
+        assert scroll_timeline.call_count == 3
+
     def test_scrolls_all_timeline_pages_and_restores_top(self, tmp_path) -> None:
         (tmp_path / "draft_content.json").write_text(
             json.dumps({"materials": {"audios": [{"effect_id": "sound-1"}]}}),

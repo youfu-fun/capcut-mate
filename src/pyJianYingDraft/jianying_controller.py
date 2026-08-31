@@ -432,6 +432,35 @@ class JianyingController:
         )
 
     @staticmethod
+    def _count_native_sticker_resources(draft_dir: Optional[str]) -> int:
+        """统计草稿中需要剪映联网加载的内置贴纸数量。"""
+        if not draft_dir:
+            return 0
+
+        content_path = os.path.join(draft_dir, "draft_content.json")
+        try:
+            with open(content_path, "r", encoding="utf-8") as content_file:
+                content = json.load(content_file)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning(
+                "Unable to inspect draft native sticker resources: path=%s error=%r",
+                content_path,
+                exc,
+            )
+            return 0
+
+        stickers = content.get("materials", {}).get("stickers", [])
+        return sum(
+            1
+            for sticker in stickers
+            if isinstance(sticker, dict)
+            and any(
+                str(sticker.get(field) or "").strip()
+                for field in ("sticker_id", "resource_id")
+            )
+        )
+
+    @staticmethod
     def _is_timeline_clip_pixel(red: int, green: int, blue: int) -> bool:
         """判断像素是否更像时间线片段，而不是深色空白背景。"""
         brightest = max(red, green, blue)
@@ -634,12 +663,14 @@ class JianyingController:
             return
 
         native_audio_count = self._count_native_audio_resources(draft_dir)
-        if native_audio_count == 0:
+        native_sticker_count = self._count_native_sticker_resources(draft_dir)
+        if native_audio_count + native_sticker_count == 0:
             return
 
         logger.info(
-            "Scanning Jianying timeline for native audio resources: count=%d",
+            "Scanning Jianying timeline for native resources: audio=%d stickers=%d",
             native_audio_count,
+            native_sticker_count,
         )
 
         # 从轨道顶部开始，避免上一次手动滚动位置影响本次扫描。
