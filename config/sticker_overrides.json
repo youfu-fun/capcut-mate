@@ -5,7 +5,11 @@
         "image_url": "https://p3-heycan-jy-sign.byteimg.com/tos-cn-i-3jr8j4ixpe/1ac56f876c55465b9abc7e8d67da7d9e~tplv-3jr8j4ixpe-resize:200:200.png?x-expires=1819698643&x-signature=1adF2W9%2FL3j5a5MCGi5G7ytHJeU%3D"
       },
       "preview_cover": "https://p3-heycan-jy-sign.byteimg.com/tos-cn-i-3jr8j4ixpe/1ac56f876c55465b9abc7e8d67da7d9e~tplv-3jr8j4ixpe-resize:200:200.png?x-expires=1819698643&x-signature=1adF2W9%2FL3j5a5MCGi5G7ytHJeU%3D",
-      "sticker_package": {},
+      "sticker_package": {
+        "height_per_frame": 0,
+        "size": 0,
+        "width_per_frame": 0
+      },
       "sticker_type": 1,
       "track_thumbnail": "https://p3-heycan-jy-sign.byteimg.com/tos-cn-i-3jr8j4ixpe/1ac56f876c55465b9abc7e8d67da7d9e~tplv-3jr8j4ixpe-resize:200:200.png?x-expires=1819698643&x-signature=1adF2W9%2FL3j5a5MCGi5G7ytHJeU%3D"
     },
