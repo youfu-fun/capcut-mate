@@ -1,4 +1,4 @@
-from typing import List, Literal
+from typing import Any, List, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -29,6 +29,8 @@ class StickerItem(BaseModel):
     sticker: StickerInfo = Field(..., description="贴纸信息")
     sticker_id: str = Field(..., description="贴纸ID")
     title: str = Field(..., description="贴纸标题")
+    search_aliases: List[str] = Field(default_factory=list, description="补录检索别名")
+    catalog: dict[str, Any] = Field(default_factory=dict, description="资产验证元数据")
 
 
 class SearchStickerRequest(BaseModel):

@@ -51,6 +51,11 @@ def test_verified_draft_override_is_searchable_by_alias(tmp_path, monkeypatch):
                     "sticker_id": "7616307736162143550",
                     "title": "跳舞奶牛猫",
                     "search_aliases": ["站立摆臂猫", "动态猫咪"],
+                    "catalog": {
+                        "source_provider": "capcut_draft_verified",
+                        "cycle_setting": True,
+                        "verified_in_capcut": True,
+                    },
                 }
             ],
             ensure_ascii=False,
@@ -63,4 +68,6 @@ def test_verified_draft_override_is_searchable_by_alias(tmp_path, monkeypatch):
     result = search_sticker(keywords=["站立", "摆臂", "猫"], match_mode="all")
 
     assert [item["sticker_id"] for item in result] == ["7616307736162143550"]
-    assert SearchStickerResponse(data=result).data[0].sticker.sticker_package.size == 0
+    response = SearchStickerResponse(data=result)
+    assert response.data[0].sticker.sticker_package.size == 0
+    assert response.data[0].catalog["verified_in_capcut"] is True
