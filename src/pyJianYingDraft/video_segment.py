@@ -592,9 +592,7 @@ class StickerSegment(VisualSegment):
     resource_id: str
     """贴纸资源id"""
 
-    def __init__(self, resource_id: str, target_timerange: Timerange, *,
-                 clip_settings: Optional[ClipSettings] = None,
-                 material_payload: Optional[Dict[str, Any]] = None):
+    def __init__(self, resource_id: str, target_timerange: Timerange, *, clip_settings: Optional[ClipSettings] = None):
         """根据贴纸resource_id构建一个贴纸片段, 并指定其时间信息及图像调节设置
 
         片段创建完成后, 可通过`ScriptFile.add_segment`方法将其添加到轨道中
@@ -606,16 +604,13 @@ class StickerSegment(VisualSegment):
         """
         super().__init__(uuid.uuid4().hex, None, target_timerange, 1.0, 1.0, False, clip_settings=clip_settings)
         self.resource_id = resource_id
-        self.material_payload = deepcopy(material_payload) if material_payload else {}
 
     def export_material(self) -> Dict[str, Any]:
-        """Create the sticker material, preserving catalog metadata when supplied."""
-        material = deepcopy(self.material_payload)
-        material.update({
+        """创建极简的贴纸素材对象, 以此不再单独定义贴纸素材类"""
+        return {
             "id": self.material_id,
             "resource_id": self.resource_id,
             "sticker_id": self.resource_id,
             "source_platform": 1,
             "type": "sticker",
-        })
-        return material
+        }
