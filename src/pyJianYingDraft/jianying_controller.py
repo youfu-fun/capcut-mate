@@ -723,22 +723,64 @@ class JianyingController:
         )
 
     def _find_export_succeed_close_btn(self) -> Optional[uia.Control]:
-        """在当前窗口或「导出」子窗口中查找导出成功关闭按钮。"""
+        """兼容剪映 5.9 不同成功页层级和控件类型。"""
+        roots = [self.app]
+        export_window_factory = lambda: self.app.WindowControl(
+            searchDepth=2,
+            Name="导出",
+        )
         if self._safe_exists(
-            lambda: self._make_export_succeed_close_btn(from_export_window=False),
-            "find_export_succeed_close_btn.main",
-        ):
-            return self._make_export_succeed_close_btn(from_export_window=False)
-
-        if self._safe_exists(
-            lambda: self.app.WindowControl(searchDepth=2, Name="导出"),
+            export_window_factory,
             "find_export_succeed_close_btn.export_window",
+            timeout=0,
         ):
-            if self._safe_exists(
-                lambda: self._make_export_succeed_close_btn(from_export_window=True),
-                "find_export_succeed_close_btn.in_export_window",
+            roots.append(export_window_factory())
+
+        for root_index, root in enumerate(roots):
+            for depth in range(1, 7):
+                factories = (
+                    lambda root=root, depth=depth: root.TextControl(
+                        searchDepth=depth,
+                        Compare=ControlFinder.desc_matcher(
+                            "ExportSucceedCloseBtn",
+                            depth=depth,
+                        ),
+                    ),
+                    lambda root=root, depth=depth: root.ButtonControl(
+                        searchDepth=depth,
+                        Compare=ControlFinder.desc_matcher(
+                            "ExportSucceedCloseBtn",
+                            depth=depth,
+                        ),
+                    ),
+                )
+                for control_index, factory in enumerate(factories):
+                    if self._safe_exists(
+                        factory,
+                        (
+                            "find_export_succeed_close_btn.semantic"
+                            f"[{root_index},{depth},{control_index}]"
+                        ),
+                        timeout=0,
+                    ):
+                        return factory()
+
+            for control_name, factory in (
+                (
+                    "text",
+                    lambda root=root: root.TextControl(searchDepth=6, Name="关闭"),
+                ),
+                (
+                    "button",
+                    lambda root=root: root.ButtonControl(searchDepth=6, Name="关闭"),
+                ),
             ):
-                return self._make_export_succeed_close_btn(from_export_window=True)
+                if self._safe_exists(
+                    factory,
+                    f"find_export_succeed_close_btn.name[{root_index},{control_name}]",
+                    timeout=0,
+                ):
+                    return factory()
         return None
 
     def _require_export_succeed_close_btn(self) -> uia.Control:
@@ -940,7 +982,11 @@ class JianyingController:
             pass  # 某些情况下可能失败，但继续执行
         time.sleep(1)
 
-    def wait_for_export_completion(self, timeout: float) -> bool:
+    def wait_for_export_completion(
+        self,
+        timeout: float,
+        output_path: Optional[str] = None,
+    ) -> bool:
         """等待导出完成
         
         Args:
@@ -955,13 +1001,19 @@ class JianyingController:
         # 点击继续导出按钮次数
         continue_export_click_count = 0
         export_succeeded = False
+        last_output_size = -1
+        stable_output_checks = 0
 
         # 等待导出完成
         st = time.time()
         while True:
             self.get_window()
             if self.app_status != "pre_export":
-                break
+                return bool(
+                    output_path
+                    and os.path.isfile(output_path)
+                    and os.path.getsize(output_path) > 0
+                )
 
             if self._find_export_succeed_close_btn() is not None:
                 logger.info("Export finished, closing success dialog")
@@ -973,11 +1025,36 @@ class JianyingController:
                 export_succeeded = True
                 break
 
+            output_exists = bool(
+                output_path
+                and os.path.isfile(output_path)
+                and os.path.getsize(output_path) > 0
+            )
+            if output_exists:
+                current_size = os.path.getsize(output_path)
+                if current_size == last_output_size:
+                    stable_output_checks += 1
+                else:
+                    last_output_size = current_size
+                    stable_output_checks = 1
+                if stable_output_checks >= 3:
+                    logger.info(
+                        "Export output is stable; closing unrecognized success page with ESC: %s",
+                        output_path,
+                    )
+                    pyautogui.press("esc")
+                    time.sleep(2)
+                    export_succeeded = True
+                    break
+            else:
+                last_output_size = -1
+                stable_output_checks = 0
+
             if time.time() - st > timeout:
                 raise AutomationError("导出超时, 时限为%d秒" % timeout)
 
             # 导出过程中，如果出现异常弹窗，则点击继续导出按钮
-            if continue_export_click_count < 20:
+            if not output_exists and continue_export_click_count < 20:
                 print("pyautogui.size(): ", pyautogui.size(), ", click index: ", continue_export_click_count)
                 pyautogui.click(x=996, y=597, button="left")
                 continue_export_click_count += 1
@@ -1069,7 +1146,7 @@ class JianyingController:
                     self.get_window()
                 elif self.app_sub_status == "exporting":
                     logger.info("[%d]app is already in pre_export[exporting] page", i)
-                    if self.wait_for_export_completion(timeout):
+                    if self.wait_for_export_completion(timeout, original_path):
                         export_completed = True
                         self.return_to_home()
                         break
@@ -1243,11 +1320,7 @@ class JianyingController:
                 return
 
             # 2. 检查窗口是否停留在导出完成页面
-            if self._safe_exists(
-                lambda: self._make_export_succeed_close_btn(from_export_window=False),
-                "init_export_sub_status.export_succeed",
-                timeout=0,
-            ):
+            if self._find_export_succeed_close_btn() is not None:
                 self.app_sub_status = "export_succeed"
                 return
         else:

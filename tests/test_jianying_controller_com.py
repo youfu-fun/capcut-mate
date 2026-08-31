@@ -316,3 +316,21 @@ class TestJianying59AudioDownloadRetry:
             pytest.raises(Exception, match="音频下载持续失败"),
         ):
             ctrl.retry_failed_audio_downloads()
+
+    def test_stable_export_file_closes_unrecognized_success_page(self, tmp_path) -> None:
+        output = tmp_path / "export.mp4"
+        output.write_bytes(b"video")
+        ctrl = JianyingController.__new__(JianyingController)
+        ctrl.app_status = "pre_export"
+
+        with (
+            patch.object(ctrl, "get_window"),
+            patch.object(ctrl, "_find_export_succeed_close_btn", return_value=None),
+            patch("src.pyJianYingDraft.jianying_controller.time.time", return_value=0),
+            patch("src.pyJianYingDraft.jianying_controller.time.sleep"),
+            patch("src.pyJianYingDraft.jianying_controller.pyautogui.press") as press,
+        ):
+            completed = ctrl.wait_for_export_completion(10, str(output))
+
+        assert completed is True
+        press.assert_called_once_with("esc")
