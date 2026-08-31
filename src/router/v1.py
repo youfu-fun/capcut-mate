@@ -702,7 +702,10 @@ def search_sticker(ssr: SearchStickerRequest) -> SearchStickerResponse:
     
     # 调用service层处理业务逻辑
     data = service.search_sticker(
-        keyword=ssr.keyword
+        keyword=ssr.keyword,
+        keywords=ssr.keywords,
+        match_mode=ssr.match_mode,
+        limit=ssr.limit,
     )
     
     return SearchStickerResponse(data=data)

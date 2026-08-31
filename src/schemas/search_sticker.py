@@ -1,5 +1,6 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Literal
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class StickerPackage(BaseModel):
@@ -32,7 +33,16 @@ class StickerItem(BaseModel):
 
 class SearchStickerRequest(BaseModel):
     """搜索贴纸请求参数"""
-    keyword: str = Field(..., description="关键词，必选参数")
+    keyword: str = Field(default="", description="兼容旧客户端的单关键词")
+    keywords: List[str] = Field(default_factory=list, description="组合检索词")
+    match_mode: Literal["all", "any"] = Field(default="all", description="组合词匹配模式")
+    limit: int = Field(default=50, ge=1, le=200, description="最大返回数量")
+
+    @model_validator(mode="after")
+    def require_search_term(self):
+        if not self.keyword.strip() and not any(item.strip() for item in self.keywords):
+            raise ValueError("keyword 或 keywords 至少提供一个")
+        return self
 
 
 class SearchStickerResponse(BaseModel):

@@ -1,0 +1,44 @@
+[
+  {
+    "sticker": {
+      "large_image": {
+        "image_url": "https://p3-heycan-jy-sign.byteimg.com/tos-cn-i-3jr8j4ixpe/1ac56f876c55465b9abc7e8d67da7d9e~tplv-3jr8j4ixpe-resize:200:200.png?x-expires=1819698643&x-signature=1adF2W9%2FL3j5a5MCGi5G7ytHJeU%3D"
+      },
+      "preview_cover": "https://p3-heycan-jy-sign.byteimg.com/tos-cn-i-3jr8j4ixpe/1ac56f876c55465b9abc7e8d67da7d9e~tplv-3jr8j4ixpe-resize:200:200.png?x-expires=1819698643&x-signature=1adF2W9%2FL3j5a5MCGi5G7ytHJeU%3D",
+      "sticker_package": {},
+      "sticker_type": 1,
+      "track_thumbnail": "https://p3-heycan-jy-sign.byteimg.com/tos-cn-i-3jr8j4ixpe/1ac56f876c55465b9abc7e8d67da7d9e~tplv-3jr8j4ixpe-resize:200:200.png?x-expires=1819698643&x-signature=1adF2W9%2FL3j5a5MCGi5G7ytHJeU%3D"
+    },
+    "sticker_id": "7616307736162143550",
+    "title": "跳舞奶牛猫",
+    "search_aliases": [
+      "跳舞猫",
+      "猫跳舞",
+      "奶牛猫跳舞",
+      "站立跳舞猫",
+      "摆臂跳舞猫",
+      "动态猫咪"
+    ],
+    "catalog": {
+      "source_provider": "capcut_draft_verified",
+      "source_locator": "draft://202608311030264a6c0fb4",
+      "source_draft_sha256": "78c2c9a2ed068578580b9c0935d8be302af85d8a23493b2f77c9c0c587b5f4a1",
+      "preview_sha256": "b97fd23fce3b5e58530fa8f27e25815bf1ff773c9735dec2581216ae2291d092",
+      "verified_at": "2026-08-31T16:00:00+08:00",
+      "status": "ready",
+      "animation_phase": "loop",
+      "tags": [
+        "猫",
+        "奶牛猫",
+        "跳舞",
+        "站立",
+        "摆臂",
+        "动态",
+        "循环"
+      ],
+      "cycle_setting": true,
+      "verified_duration_us": 3000000,
+      "verified_in_capcut": true
+    }
+  }
+]

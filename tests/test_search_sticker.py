@@ -29,18 +29,18 @@ def test_search_sticker():
     # 测试搜索不到内容的情况
     print("\n2. 测试搜索不存在的关键词 '不存在的关键词':")
     result = search_sticker("不存在的关键词")
-    print(f"   找到 {len(result)} 条记录（应该是随机的50条）")
-    if result:
-        print(f"   第一条记录标题: {result[0]['title']}")
+    print(f"   找到 {len(result)} 条记录（应该为0条，不再随机回退）")
+    assert result == []
     
     # 测试空关键词
     print("\n3. 测试空关键词:")
     result = search_sticker("")
-    print(f"   找到 {len(result)} 条记录")
-    if len(result) > 50:
-        print("   应该只返回前50条记录")
-    else:
-        print(f"   返回了 {len(result)} 条记录")
+    assert result == []
+
+    print("\n4. 测试组合关键词:")
+    result = search_sticker(keywords=["猫", "跳舞"], match_mode="all", limit=200)
+    assert result
+    assert all("猫" in item["title"] and "跳舞" in item["title"] for item in result)
     
     print("\n测试完成!")
 

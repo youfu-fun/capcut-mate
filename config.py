@@ -37,6 +37,9 @@ TIP_URL = os.getenv("TIP_URL", f"{SERVER_BASE_URL}/docs")
 
 # 贴纸配置文件路径
 STICKER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "sticker.json")
+STICKER_OVERRIDE_CONFIG_PATH = os.path.join(
+    os.path.dirname(__file__), "config", "sticker_overrides.json"
+)
 
 # 花字配置文件路径
 HUAZI_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "huazi.json")
