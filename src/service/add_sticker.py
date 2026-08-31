@@ -9,6 +9,7 @@ import config
 import asyncio
 from typing import Tuple
 from src.utils.draft_lock_manager import DraftLockManager
+from src.utils.sticker_catalog import build_sticker_material
 
 
 def add_sticker(
@@ -92,7 +93,8 @@ def add_sticker(
         sticker_segment = StickerSegment(
             resource_id=sticker_id,
             target_timerange=trange(start=start, duration=duration),
-            clip_settings=clip_settings
+            clip_settings=clip_settings,
+            material_payload=build_sticker_material(sticker_id),
         )
         logger.info(f"Created sticker segment, segment_id: {sticker_segment.segment_id}, resource_id: {sticker_id}")
     except Exception as e:

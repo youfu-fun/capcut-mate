@@ -16,7 +16,7 @@ from typing import List, Dict, Any, Tuple, Optional, Literal
 import asyncio
 
 from src.utils.logger import logger
-from src.pyJianYingDraft import ScriptFile, TrackType, TextSegment, TextStyle, ClipSettings, Timerange, FontType, TextBorder, TextShadow
+from src.pyJianYingDraft import ScriptFile, TrackType, TextSegment, TextStyle, ClipSettings, Timerange, FontType, TextBorder, TextBackground, TextShadow
 from src.pyJianYingDraft.metadata import TextIntro, TextOutro, TextLoopAnim
 from src.utils.draft_cache import DRAFT_CACHE
 from exceptions import CustomException, CustomError
@@ -147,7 +147,14 @@ def add_captions(
     bold: bool = False,
     has_shadow: bool = False,
     shadow_info: Optional[ShadowInfo] = None,
-    text_effect: Optional[str] = None
+    text_effect: Optional[str] = None,
+    text_type: Literal["subtitle", "text"] = "subtitle",
+    background_color: Optional[str] = None,
+    background_alpha: float = 1.0,
+    background_style: Literal[1, 2] = 1,
+    background_round_radius: float = 0.0,
+    background_height: float = 0.14,
+    background_width: float = 0.14,
 ) -> Tuple[str, str, List[str], List[str], List[dict]]:
     """
     批量添加字幕到剪映草稿的业务逻辑
@@ -266,6 +273,13 @@ def add_captions(
                     has_shadow=has_shadow,
                     shadow_info=shadow_info,
                     text_effect=text_effect,
+                    text_type=text_type,
+                    background_color=background_color,
+                    background_alpha=background_alpha,
+                    background_style=background_style,
+                    background_round_radius=background_round_radius,
+                    background_height=background_height,
+                    background_width=background_width,
                 )
                 segment_ids.append(segment_id)
                 text_ids.append(text_id)
@@ -322,6 +336,13 @@ async def add_captions_async(
     has_shadow: bool = False,
     shadow_info: Optional[ShadowInfo] = None,
     text_effect: Optional[str] = None,
+    text_type: Literal["subtitle", "text"] = "subtitle",
+    background_color: Optional[str] = None,
+    background_alpha: float = 1.0,
+    background_style: Literal[1, 2] = 1,
+    background_round_radius: float = 0.0,
+    background_height: float = 0.14,
+    background_width: float = 0.14,
     lock_timeout: float = 30.0
 ) -> Tuple[str, str, List[str], List[str], List[dict]]:
     """
@@ -411,7 +432,14 @@ async def add_captions_async(
             bold=bold,
             has_shadow=has_shadow,
             shadow_info=shadow_info,
-            text_effect=text_effect
+            text_effect=text_effect,
+            text_type=text_type,
+            background_color=background_color,
+            background_alpha=background_alpha,
+            background_style=background_style,
+            background_round_radius=background_round_radius,
+            background_height=background_height,
+            background_width=background_width,
         )
     finally:
         # 释放锁
@@ -442,6 +470,13 @@ def add_caption_to_draft(
     has_shadow: bool = False,
     shadow_info: Optional[ShadowInfo] = None,
     text_effect: Optional[str] = None,
+    text_type: Literal["subtitle", "text"] = "subtitle",
+    background_color: Optional[str] = None,
+    background_alpha: float = 1.0,
+    background_style: Literal[1, 2] = 1,
+    background_round_radius: float = 0.0,
+    background_height: float = 0.14,
+    background_width: float = 0.14,
 ) -> Tuple[str, str, dict]:
     """
     向剪映草稿中添加单个字幕
@@ -542,7 +577,7 @@ def add_caption_to_draft(
             vertical=is_vertical,
             letter_spacing=int(letter_spacing) if letter_spacing is not None else 0,
             line_spacing=int(line_spacing) if line_spacing is not None else 0,
-            auto_wrapping=True,  # 字幕默认开启自动换行
+            auto_wrapping=text_type == "subtitle",
             underline=underline,
             italic=italic,
             bold=bold
@@ -599,6 +634,17 @@ def add_caption_to_draft(
                     angle=shadow_info.shadow_angle
                 )
         
+        text_background = None
+        if background_color:
+            text_background = TextBackground(
+                color=background_color,
+                style=background_style,
+                alpha=background_alpha,
+                round_radius=background_round_radius,
+                height=background_height,
+                width=background_width,
+            )
+
         # 8. 创建文本片段
         text_segment = TextSegment(
             text=caption['text'],
@@ -606,6 +652,7 @@ def add_caption_to_draft(
             style=text_style,
             border=text_border,  # 添加边框
             font=font_type,      # 添加字体
+            background=text_background,
             shadow=text_shadow,  # 添加阴影
             clip_settings=clip_settings
         )

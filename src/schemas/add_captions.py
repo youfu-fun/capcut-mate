@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 
 class ShadowInfo(BaseModel):
@@ -39,6 +39,16 @@ class AddCaptionsRequest(BaseModel):
     has_shadow: bool = Field(default=False, description="是否启用文本阴影")
     shadow_info: Optional[ShadowInfo] = Field(default=None, description="文本阴影参数")
     text_effect: Optional[str] = Field(default=None, description="花字效果名称或 effect_id，例如：'白字橘色发光花字'")
+    text_type: Literal["subtitle", "text"] = Field(
+        default="subtitle",
+        description="文字素材类型：subtitle 为对白字幕，text 为标题/花字/提示字",
+    )
+    background_color: Optional[str] = Field(default=None, description="文字背景色（十六进制）")
+    background_alpha: float = Field(default=1.0, ge=0.0, le=1.0, description="文字背景透明度")
+    background_style: int = Field(default=1, ge=1, le=2, description="剪映文字背景样式")
+    background_round_radius: float = Field(default=0.0, ge=0.0, le=1.0, description="文字背景圆角")
+    background_height: float = Field(default=0.14, ge=0.0, le=1.0, description="文字背景高度")
+    background_width: float = Field(default=0.14, ge=0.0, le=1.0, description="文字背景宽度")
 
 
 class CaptionItem(BaseModel):

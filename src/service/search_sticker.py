@@ -1,9 +1,8 @@
 from src.utils.logger import logger
 from typing import Any, Dict, List, Literal
-import json
-import config
 import re
 import unicodedata
+from src.utils.sticker_catalog import load_sticker_catalog
 
 
 def _normalize(value: str) -> str:
@@ -35,27 +34,9 @@ def search_sticker(
     if not terms:
         return []
     
-    # 从公开目录和真实草稿补录目录中读取贴纸数据；相同 ID 以补录记录为准。
+    # 搜索与草稿写入共用同一目录，避免“能搜到但无法落到草稿”。
     try:
-        with open(config.STICKER_CONFIG_PATH, 'r', encoding='utf-8') as f:
-            sticker_data = json.load(f)
-        override_path = getattr(config, "STICKER_OVERRIDE_CONFIG_PATH", "")
-        if override_path:
-            try:
-                with open(override_path, 'r', encoding='utf-8') as f:
-                    override_data = json.load(f)
-            except FileNotFoundError:
-                override_data = []
-            by_id = {str(item.get("sticker_id", "")): item for item in sticker_data}
-            for item in override_data:
-                by_id[str(item.get("sticker_id", ""))] = item
-            sticker_data = list(by_id.values())
-    except FileNotFoundError:
-        logger.error(f"Sticker config file not found: {config.STICKER_CONFIG_PATH}")
-        return []
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse sticker config file: {e}")
-        return []
+        sticker_data = load_sticker_catalog()
     except Exception as e:
         logger.error(f"Failed to read sticker config file: {e}")
         return []
