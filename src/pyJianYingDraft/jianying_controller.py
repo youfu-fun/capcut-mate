@@ -425,6 +425,12 @@ class JianyingController:
             1
             for audio in audios
             if isinstance(audio, dict)
+            # 本地音频也会把自身 material UUID 写入 music_id。只要 path
+            # 存在，它就是已经落盘的音频，不能当成剪映内置资源触发 RPA
+            # 的时间线补点逻辑。
+            and not str(audio.get("path") or "").strip()
+            and str(audio.get("type") or "").strip().lower()
+            not in ("extract_music", "local")
             and any(
                 str(audio.get(field) or "").strip()
                 for field in ("music_id", "effect_id", "resource_id")

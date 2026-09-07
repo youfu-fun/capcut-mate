@@ -177,10 +177,15 @@ class TestJianying59AudioDownloadRetry:
                 {
                     "materials": {
                         "audios": [
-                            {"effect_id": "sound-1"},
-                            {"music_id": "music-1"},
-                            {"resource_id": "resource-1"},
-                            {"path": "C:/voice.mp3"},
+                            {"effect_id": "sound-1", "type": "sound", "path": ""},
+                            {"music_id": "music-1", "type": "music", "path": ""},
+                            {"resource_id": "resource-1", "type": "music", "path": ""},
+                            {
+                                "id": "local-1",
+                                "music_id": "local-1",
+                                "type": "extract_music",
+                                "path": "C:/voice.mp3",
+                            },
                         ]
                     }
                 }
@@ -189,6 +194,37 @@ class TestJianying59AudioDownloadRetry:
         )
 
         assert JianyingController._count_native_audio_resources(str(tmp_path)) == 3
+
+    def test_local_audio_uuid_does_not_trigger_timeline_scan(self, tmp_path) -> None:
+        (tmp_path / "draft_content.json").write_text(
+            json.dumps(
+                {
+                    "materials": {
+                        "audios": [
+                            {
+                                "id": "material-uuid",
+                                "local_material_id": "material-uuid",
+                                "music_id": "material-uuid",
+                                "type": "extract_music",
+                                "path": "C:/draft/assets/audios/voice.mp3",
+                            }
+                        ],
+                        "stickers": [],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        ctrl = JianyingController.__new__(JianyingController)
+
+        with (
+            patch.object(ctrl, "_scroll_timeline") as scroll_timeline,
+            patch.object(ctrl, "_retry_visible_audio_downloads") as retry_visible,
+        ):
+            ctrl.retry_failed_audio_downloads(draft_dir=str(tmp_path))
+
+        scroll_timeline.assert_not_called()
+        retry_visible.assert_not_called()
 
     def test_counts_native_sticker_resources(self, tmp_path) -> None:
         (tmp_path / "draft_content.json").write_text(
