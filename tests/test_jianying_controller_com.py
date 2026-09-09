@@ -300,7 +300,7 @@ class TestJianying59AudioDownloadRetry:
                 "_find_visual_timeline_clip_points_on_screen",
                 return_value=[(450, 600)],
             ),
-            patch.object(ctrl, "_retry_visible_audio_downloads"),
+            patch.object(ctrl, "_retry_visible_audio_downloads") as retry_visible,
             patch.object(
                 ctrl,
                 "_get_timeline_view_signature",
@@ -313,6 +313,7 @@ class TestJianying59AudioDownloadRetry:
 
         assert click.call_count == 1
         assert scroll_timeline.call_count == 3
+        retry_visible.assert_not_called()
 
     def test_scrolls_all_timeline_pages_and_restores_top(self, tmp_path) -> None:
         (tmp_path / "draft_content.json").write_text(

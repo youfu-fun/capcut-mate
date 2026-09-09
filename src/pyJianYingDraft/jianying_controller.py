@@ -723,7 +723,11 @@ class JianyingController:
 
                 if clip_points:
                     time.sleep(AUDIO_TIMELINE_ACTIVATION_INTERVAL)
-                self._retry_visible_audio_downloads()
+                # 贴纸也需要遍历并点击时间线片段来触发加载，但不能因此启用
+                # “音频下载失败”红色图标检测；否则食品画面中的红色区域会被
+                # 误判为音频重试按钮并阻断导出。
+                if native_audio_count:
+                    self._retry_visible_audio_downloads()
 
                 before_scroll = self._get_timeline_view_signature()
                 self._scroll_timeline(-AUDIO_TIMELINE_SCROLL_CLICKS)
