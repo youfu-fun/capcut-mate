@@ -57,6 +57,8 @@ AUDIO_TIMELINE_SCROLL_CLICKS = 6
 AUDIO_TIMELINE_RESET_CLICKS = 120
 AUDIO_TIMELINE_SCROLL_INTERVAL = 0.8
 AUDIO_TIMELINE_ACTIVATION_INTERVAL = 1.5
+SCREEN_GRAB_MAX_RETRIES = 4
+SCREEN_GRAB_RETRY_INTERVAL = 0.5
 
 
 def is_com_uia_error(exc: BaseException) -> bool:
@@ -394,7 +396,7 @@ class JianyingController:
 
     def _find_visual_audio_retry_points_on_screen(self) -> list[tuple[int, int]]:
         try:
-            return self._find_visual_audio_retry_points(pyautogui.screenshot())
+            return self._find_visual_audio_retry_points(self._grab_screen())
         except Exception as exc:
             logger.warning(
                 "Unable to inspect Jianying timeline screenshot for audio retry: %r",
@@ -561,7 +563,7 @@ class JianyingController:
         self,
     ) -> list[tuple[int, int]]:
         try:
-            return self._find_visual_timeline_clip_points(pyautogui.screenshot())
+            return self._find_visual_timeline_clip_points(self._grab_screen())
         except Exception as exc:
             logger.warning(
                 "Unable to inspect Jianying timeline clips: %r",
@@ -595,14 +597,39 @@ class JianyingController:
 
     def _get_timeline_view_signature(self) -> bytes:
         try:
-            return self._timeline_view_signature(pyautogui.screenshot())
+            return self._timeline_view_signature(self._grab_screen())
         except Exception as exc:
             logger.warning("Unable to snapshot Jianying timeline: %r", exc)
             return b""
 
+    @staticmethod
+    def _grab_screen():
+        """Retry transient Windows/RDP capture failures before giving up."""
+        last_error: Optional[Exception] = None
+        for attempt in range(1, SCREEN_GRAB_MAX_RETRIES + 1):
+            try:
+                screenshot = pyautogui.screenshot()
+                if screenshot.size[0] > 0 and screenshot.size[1] > 0:
+                    return screenshot
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Windows screen grab failed, retrying: attempt=%d/%d error=%r",
+                    attempt,
+                    SCREEN_GRAB_MAX_RETRIES,
+                    exc,
+                )
+            if attempt < SCREEN_GRAB_MAX_RETRIES:
+                time.sleep(SCREEN_GRAB_RETRY_INTERVAL)
+        raise AutomationError(
+            "Windows 桌面截图不可用；请保持交互式桌面已登录、未锁屏，且不要最小化 RDP 窗口"
+        ) from last_error
+
     def _scroll_timeline(self, clicks: int) -> None:
-        screenshot = pyautogui.screenshot()
-        width, height = screenshot.size
+        # 滚动只需要屏幕尺寸；不能因 Pillow/ImageGrab 的瞬时抓屏失败中断整个导出。
+        width, height = pyautogui.size()
+        if width <= 0 or height <= 0:
+            raise AutomationError("Windows 交互式桌面尺寸不可用")
         pyautogui.moveTo(int(width * 0.72), int(height * 0.82))
         pyautogui.scroll(clicks)
 

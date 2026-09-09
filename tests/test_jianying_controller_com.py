@@ -124,6 +124,47 @@ class TestExistsWithComRetry:
 
 
 class TestJianying59AudioDownloadRetry:
+    def test_screen_grab_retries_transient_failure(self) -> None:
+        image = Image.new("RGB", (1200, 800), (20, 24, 30))
+
+        with (
+            patch(
+                "src.pyJianYingDraft.jianying_controller.pyautogui.screenshot",
+                side_effect=[OSError("screen grab failed"), image],
+            ) as screenshot,
+            patch("src.pyJianYingDraft.jianying_controller.time.sleep") as sleep,
+        ):
+            result = JianyingController._grab_screen()
+
+        assert result is image
+        assert screenshot.call_count == 2
+        sleep.assert_called_once()
+
+    def test_scroll_timeline_does_not_require_screen_grab(self) -> None:
+        ctrl = JianyingController.__new__(JianyingController)
+
+        with (
+            patch(
+                "src.pyJianYingDraft.jianying_controller.pyautogui.size",
+                return_value=(1920, 1080),
+            ),
+            patch(
+                "src.pyJianYingDraft.jianying_controller.pyautogui.screenshot",
+                side_effect=OSError("screen grab failed"),
+            ) as screenshot,
+            patch(
+                "src.pyJianYingDraft.jianying_controller.pyautogui.moveTo"
+            ) as move_to,
+            patch(
+                "src.pyJianYingDraft.jianying_controller.pyautogui.scroll"
+            ) as scroll,
+        ):
+            ctrl._scroll_timeline(-6)
+
+        screenshot.assert_not_called()
+        move_to.assert_called_once_with(1382, 885)
+        scroll.assert_called_once_with(-6)
+
     def test_matches_audio_download_failure_text(self) -> None:
         control = type(
             "FakeControl",
