@@ -12,6 +12,10 @@ class SceneTimelineItem(BaseModel):
 class AddVideosRequest(BaseModel):
     """批量添加视频请求参数"""
     draft_url: str = Field(default="", description="草稿URL")
+    track_id: Optional[str] = Field(
+        default=None,
+        description="已有视频轨道 ID；传入时追加到该轨道，不再新建轨道",
+    )
     video_infos: str = Field(default="", description="视频信息列表, 用JSON字符串表示")
     scene_timelines: Optional[List[SceneTimelineItem]] = Field(default=None, description="场景时间线列表，用于视频变速")
     alpha: float = Field(default=1.0, description="全局透明度[0, 1]")

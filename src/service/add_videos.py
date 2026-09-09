@@ -33,6 +33,7 @@ from src.utils.draft_lock_manager import get_draft_lock_manager
 def add_videos(
     draft_url: str, 
     video_infos: str,
+    track_id: Optional[str] = None,
     scene_timelines: Optional[List[Dict[str, int]]] = None,
     alpha: float = 1.0, 
     scale_x: float = 1.0, 
@@ -88,6 +89,7 @@ def add_videos(
     return _add_videos_internal(
         draft_url=draft_url,
         video_infos=video_infos,
+        track_id=track_id,
         scene_timelines=scene_timelines,
         alpha=alpha,
         scale_x=scale_x,
@@ -127,6 +129,7 @@ def _prepare_videos_local_files(draft_url: str, video_infos: str) -> List[Dict[s
 async def add_videos_async(
     draft_url: str, 
     video_infos: str,
+    track_id: Optional[str] = None,
     scene_timelines: Optional[List[Dict[str, int]]] = None,
     alpha: float = 1.0, 
     scale_x: float = 1.0, 
@@ -203,6 +206,7 @@ async def add_videos_async(
         return _add_videos_internal(
             draft_url=draft_url,
             video_infos=video_infos,
+            track_id=track_id,
             scene_timelines=scene_timelines,
             alpha=alpha,
             scale_x=scale_x,
@@ -219,6 +223,7 @@ async def add_videos_async(
 def _add_videos_internal(
     draft_url: str,
     video_infos: str,
+    track_id: Optional[str] = None,
     scene_timelines: Optional[List[Dict[str, int]]] = None,
     alpha: float = 1.0,
     scale_x: float = 1.0,
@@ -274,9 +279,26 @@ def _add_videos_internal(
     # 4. 从缓存中获取草稿
     script: ScriptFile = DRAFT_CACHE[draft_id]
 
-    # 5. 添加视频轨道（非主轨；叠层与 add_images / add_captions / add_filters 等一致，按全局调用顺序递增 render_index）
-    track_name = f"video_track_{helper.gen_unique_id()}"
-    script.add_track_ordered(track_type=draft.TrackType.video, track_name=track_name)
+    # 5. 首批创建视频轨道；后续分批请求追加到同一轨道。
+    if track_id:
+        target_track = next(
+            (
+                item
+                for item in script.tracks.values()
+                if item.track_id == track_id
+                and item.track_type == draft.TrackType.video
+            ),
+            None,
+        )
+        if target_track is None:
+            raise CustomException(
+                CustomError.VIDEO_ADD_FAILED,
+                f"Video track not found: {track_id}",
+            )
+        track_name = target_track.name
+    else:
+        track_name = f"video_track_{helper.gen_unique_id()}"
+        script.add_track_ordered(track_type=draft.TrackType.video, track_name=track_name)
 
     # 6. 遍历视频信息，添加视频到草稿中的指定轨道，收集片段 ID 与片段信息
     segment_ids = []

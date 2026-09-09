@@ -103,6 +103,7 @@ async def add_videos(avr: AddVideosRequest) -> AddVideosResponse:
     draft_url, track_id, video_ids, segment_ids, segment_infos = await service.add_videos_async(
         draft_url=avr.draft_url,
         video_infos=avr.video_infos,
+        track_id=avr.track_id,
         scene_timelines=[{"start": t.start, "end": t.end} for t in avr.scene_timelines] if avr.scene_timelines else None,
         alpha=avr.alpha,
         scale_x=avr.scale_x,
