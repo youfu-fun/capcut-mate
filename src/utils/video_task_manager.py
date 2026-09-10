@@ -34,8 +34,9 @@ DRAFT_DOWNLOAD_MAX_CONCURRENT = 3
 # gen_video：上传到对象存储的最大并发，超出部分在 _upload_executor 队列中排队
 OBJECT_STORAGE_UPLOAD_MAX_CONCURRENT = 2
 
-# original_path 为 None 导致 shutil.move 失败时，仅重试导出阶段（复用已下载草稿）的额外次数
-EXPORT_RENAME_SRC_NONE_MAX_RETRIES = 2
+# 路径未取得是导出状态契约失败，重复整个 UI 流程不会补齐证据。
+# 保留常量供兼容调用，但不再对 rename None 重试。
+EXPORT_RENAME_SRC_NONE_MAX_RETRIES = 0
 EXPORT_RENAME_SRC_NONE_ERROR_MARKER = (
     "rename: src should be string, bytes or os.PathLike, not NoneType"
 )
@@ -503,10 +504,9 @@ class VideoGenTaskManager:
 
     @staticmethod
     def _is_export_retryable_error(error_message: str) -> bool:
-        return (
-            VideoGenTaskManager._is_export_rename_src_none_error(error_message)
-            or VideoGenTaskManager._is_export_com_uia_error(error_message)
-        )
+        if VideoGenTaskManager._is_export_rename_src_none_error(error_message):
+            return False
+        return VideoGenTaskManager._is_export_com_uia_error(error_message)
 
     @staticmethod
     def _assign_export_outfile(task: VideoGenTask) -> str:
@@ -527,8 +527,8 @@ class VideoGenTaskManager:
     def _phase_export_only(self, task: VideoGenTask) -> str:
         """
         仅执行剪映导出（在 export_video_lock 内，全局串行）。
-        若因 original_path 为 None 导致 rename 失败，最多额外重试
-        EXPORT_RENAME_SRC_NONE_MAX_RETRIES 次，复用已下载草稿、不重新下载。
+        只重试瞬时 COM/UIA 错误。路径缺失、状态停滞、导出不完整等确定性
+        失败立即返回，避免重复整套导出流程掩盖最早失败阶段。
 
         Returns:
             错误信息，成功时返回空字符串。
@@ -543,10 +543,7 @@ class VideoGenTaskManager:
             task.draft_id,
         )
         try:
-            max_attempts = 1 + max(
-                EXPORT_RENAME_SRC_NONE_MAX_RETRIES,
-                EXPORT_COM_UIA_MAX_RETRIES,
-            )
+            max_attempts = 1 + EXPORT_COM_UIA_MAX_RETRIES
             last_error = ""
 
             for attempt in range(1, max_attempts + 1):
@@ -568,22 +565,13 @@ class VideoGenTaskManager:
                     if attempt >= max_attempts:
                         return last_error
 
-                    if self._is_export_com_uia_error(last_error):
-                        logger.warning(
-                            "Export COM/UIA transient error, retrying export without "
-                            "re-downloading draft: draft_id=%s retry=%d/%d",
-                            task.draft_id,
-                            attempt,
-                            EXPORT_COM_UIA_MAX_RETRIES,
-                        )
-                    else:
-                        logger.warning(
-                            "Export rename-src-none error, retrying export without "
-                            "re-downloading draft: draft_id=%s retry=%d/%d",
-                            task.draft_id,
-                            attempt,
-                            EXPORT_RENAME_SRC_NONE_MAX_RETRIES,
-                        )
+                    logger.warning(
+                        "Export COM/UIA transient error, retrying export without "
+                        "re-downloading draft: draft_id=%s retry=%d/%d",
+                        task.draft_id,
+                        attempt,
+                        EXPORT_COM_UIA_MAX_RETRIES,
+                    )
                     self._prepare_export_retry_outfile(task)
 
             return last_error

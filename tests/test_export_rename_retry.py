@@ -1,4 +1,4 @@
-"""导出 rename src None 错误时仅重试导出阶段（复用已下载草稿）。"""
+"""只重试瞬时 COM；没有输出路径不能反复执行整个导出。"""
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -44,7 +44,7 @@ class TestExportRenameSrcNoneRetry:
         assert mgr._is_export_com_uia_error("导出草稿失败: 导出超时") is False
 
     @patch.object(VideoGenTaskManager, "_export_video")
-    def test_retries_twice_then_succeeds(self, m_export: MagicMock) -> None:
+    def test_missing_path_does_not_retry_even_if_a_later_attempt_would_succeed(self, m_export: MagicMock) -> None:
         rename_exc = Exception(EXPORT_RENAME_SRC_NONE_ERROR_MARKER)
         m_export.side_effect = [rename_exc, rename_exc, True]
         task = _task()
@@ -54,9 +54,9 @@ class TestExportRenameSrcNoneRetry:
         ) as m_prepare:
             err = VideoGenTaskManager()._phase_export_only(task)
 
-        assert err == ""
-        assert m_export.call_count == 3
-        assert m_prepare.call_count == 2
+        assert EXPORT_RENAME_SRC_NONE_ERROR_MARKER in err
+        assert m_export.call_count == 1
+        m_prepare.assert_not_called()
 
     @patch.object(VideoGenTaskManager, "_export_video")
     def test_exhausts_retries_returns_last_error(self, m_export: MagicMock) -> None:
@@ -127,3 +127,13 @@ class TestExportRenameSrcNoneRetry:
         err = VideoGenTaskManager()._phase_export_only(task)
         assert err == "导出草稿失败"
         assert m_export.call_count == 1
+
+    @pytest.mark.parametrize("code", ["EXPORT_PATH_UNRESOLVED", "EXPORT_OUTPUT_MISSING",
+                                      "EXPORT_STATE_STALLED", "EXPORT_INCOMPLETE",
+                                      "EXPORT_RESOURCE_BLOCKED", "EXPORT_COMPLETION_TIMEOUT"])
+    def test_deterministic_controller_failures_do_not_retry(self, code) -> None:
+        task = _task()
+        with patch.object(VideoGenTaskManager, "_export_video", side_effect=Exception(f"[{code}]")) as export:
+            err = VideoGenTaskManager()._phase_export_only(task)
+        assert code in err
+        assert export.call_count == 1

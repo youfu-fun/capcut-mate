@@ -59,6 +59,7 @@ AUDIO_TIMELINE_SCROLL_INTERVAL = 0.8
 AUDIO_TIMELINE_ACTIVATION_INTERVAL = 1.5
 SCREEN_GRAB_MAX_RETRIES = 4
 SCREEN_GRAB_RETRY_INTERVAL = 0.5
+EXPORT_STATE_MAX_STALLS = 3
 
 
 def is_com_uia_error(exc: BaseException) -> bool:
@@ -802,22 +803,8 @@ class JianyingController:
                     ):
                         return factory()
 
-            for control_name, factory in (
-                (
-                    "text",
-                    lambda root=root: root.TextControl(searchDepth=6, Name="关闭"),
-                ),
-                (
-                    "button",
-                    lambda root=root: root.ButtonControl(searchDepth=6, Name="关闭"),
-                ),
-            ):
-                if self._safe_exists(
-                    factory,
-                    f"find_export_succeed_close_btn.name[{root_index},{control_name}]",
-                    timeout=0,
-                ):
-                    return factory()
+            # A generic “关闭” can be the editor or an error dialog's close
+            # control. Only ExportSucceedCloseBtn establishes success here.
         return None
 
     def _require_export_succeed_close_btn(self) -> uia.Control:
@@ -932,8 +919,11 @@ class JianyingController:
         if not export_path_sib.Exists(0):
             raise AutomationError("未找到导出路径框")
         export_path_text = export_path_sib.GetSiblingControl(lambda ctrl: True)
-        assert export_path_text is not None
+        if export_path_text is None:
+            raise AutomationError("[EXPORT_PATH_UNRESOLVED] 导出路径控件没有可读文本")
         export_path = export_path_text.GetPropertyValue(30159)
+        if not isinstance(export_path, str) or not export_path.strip():
+            raise AutomationError("[EXPORT_PATH_UNRESOLVED] 导出路径控件返回空值，未启动导出")
         return export_path
 
     def set_export_resolution(self, resolution: Optional[ExportResolution]) -> None:
@@ -1035,70 +1025,78 @@ class JianyingController:
         Raises:
             AutomationError: 导出超时
         """
-        # 点击继续导出按钮次数
-        continue_export_click_count = 0
-        export_succeeded = False
-        last_output_size = -1
-        stable_output_checks = 0
+        if not isinstance(output_path, str) or not output_path.strip():
+            raise AutomationError("[EXPORT_PATH_UNRESOLVED] 未取得导出路径，停止等待并保留剪映现场")
 
         # 等待导出完成
-        st = time.time()
+        st = time.monotonic()
+        last_log_at = float("-inf")
         while True:
             self.get_window()
+            elapsed = time.monotonic() - st
+            if elapsed - last_log_at >= 15:
+                logger.info(
+                    "Export wait: elapsed=%.1fs state=%s/%s output_exists=%s output_bytes=%s",
+                    elapsed, self.app_status, getattr(self, "app_sub_status", "none"),
+                    os.path.isfile(output_path), self._export_output_size(output_path),
+                )
+                last_log_at = elapsed
             if self.app_status != "pre_export":
-                return bool(
-                    output_path
-                    and os.path.isfile(output_path)
-                    and os.path.getsize(output_path) > 0
+                raise AutomationError(
+                    "[EXPORT_STATE_LOST] 未观察到导出完成，窗口已离开导出页：%s；保留现场"
+                    % self.app_status
                 )
 
+            self._raise_if_export_resource_blocked()
             if self._find_export_succeed_close_btn() is not None:
+                self._require_exported_output(output_path)
                 logger.info("Export finished, closing success dialog")
                 self._safe_click(
                     self._require_export_succeed_close_btn,
                     "wait_for_export_completion.close_success",
                 )
                 time.sleep(2)
-                export_succeeded = True
-                break
+                return True
 
-            output_exists = bool(
-                output_path
-                and os.path.isfile(output_path)
-                and os.path.getsize(output_path) > 0
-            )
-            if output_exists:
-                current_size = os.path.getsize(output_path)
-                if current_size == last_output_size:
-                    stable_output_checks += 1
-                else:
-                    last_output_size = current_size
-                    stable_output_checks = 1
-                if stable_output_checks >= 3:
-                    logger.info(
-                        "Export output is stable; closing unrecognized success page with ESC: %s",
-                        output_path,
-                    )
-                    pyautogui.press("esc")
-                    time.sleep(2)
-                    export_succeeded = True
-                    break
-            else:
-                last_output_size = -1
-                stable_output_checks = 0
-
-            if time.time() - st > timeout:
-                raise AutomationError("导出超时, 时限为%d秒" % timeout)
-
-            # 导出过程中，如果出现异常弹窗，则点击继续导出按钮
-            if not output_exists and continue_export_click_count < 20:
-                print("pyautogui.size(): ", pyautogui.size(), ", click index: ", continue_export_click_count)
-                pyautogui.click(x=996, y=597, button="left")
-                continue_export_click_count += 1
+            if elapsed >= timeout:
+                raise AutomationError(
+                    "[EXPORT_COMPLETION_TIMEOUT] 未识别到导出完成，等待%.1f秒；"
+                    "state=%s/%s output_bytes=%s；未点击继续导出或ESC，保留现场"
+                    % (elapsed, self.app_status, getattr(self, "app_sub_status", "none"),
+                       self._export_output_size(output_path))
+                )
 
             time.sleep(1)
-        time.sleep(2)
-        return export_succeeded
+
+    def _raise_if_export_resource_blocked(self) -> None:
+        """识别已知资源错误只报错，不用坐标跳过缺失资源警告。"""
+        markers = ("导出文件缺失", "文件缺失/损坏", "媒体格式不支持", "音乐下载失败", "继续导出")
+
+        def is_warning(control, _depth):
+            name = control.Name or ""
+            description = control.GetPropertyValue(30159) or ""
+            return any(marker in str(name) or marker in str(description) for marker in markers)
+
+        warning = self.app.TextControl(searchDepth=6, Compare=is_warning)
+        if self._exists_with_com_retry(warning, "export.resource_warning", timeout=0):
+            raise AutomationError(
+                "[EXPORT_RESOURCE_BLOCKED] 剪映提示资源缺失、损坏或下载失败；"
+                "未点击继续导出，保留现场"
+            )
+
+    @staticmethod
+    def _export_output_size(path: Optional[str]) -> int:
+        try:
+            return os.path.getsize(path) if path and os.path.isfile(path) else 0
+        except OSError:
+            return 0
+
+    @classmethod
+    def _require_exported_output(cls, path: Optional[str]) -> None:
+        if not isinstance(path, str) or not path.strip():
+            raise AutomationError("[EXPORT_PATH_UNRESOLVED] 未取得导出文件路径；保留剪映现场")
+        if cls._export_output_size(path) <= 0:
+            raise AutomationError("[EXPORT_OUTPUT_MISSING] 导出完成信号没有对应非空文件；保留剪映现场")
 
     def return_to_home(self) -> None:
         """回到目录页并稍作延迟"""
@@ -1115,8 +1113,10 @@ class JianyingController:
             output_path (Optional[str]): 目标输出路径，如果为None则不移动
         """
         logger.info(f"move {original_path} to {output_path}")
+        self._require_exported_output(original_path)
         if output_path is not None:
-            shutil.move(original_path, output_path)
+            if os.path.abspath(original_path) != os.path.abspath(output_path):
+                shutil.move(original_path, output_path)
 
     def export_draft(self, draft_name: str, output_path: Optional[str] = None, *,
                      resolution: Optional[ExportResolution] = None,
@@ -1132,84 +1132,106 @@ class JianyingController:
             output_path (`str`, optional): 导出路径, 支持指向文件夹或直接指向文件, 不指定则使用剪映默认路径.
             resolution (`Export_resolution`, optional): 导出分辨率, 默认不改变剪映导出窗口中的设置.
             framerate (`Export_framerate`, optional): 导出帧率, 默认不改变剪映导出窗口中的设置.
-            timeout (`float`, optional): 导出超时时间(秒), 默认为5分钟.
+            timeout (`float`, optional): 单次导出流程预算(秒), 默认为5分钟；阶段之间检查，等待完成复用剩余预算.
             draft_dir (`str`, optional): 剪映本地草稿目录；未在首页找到草稿时会 robocopy 触发扫描后重试.
 
         Raises:
             `DraftNotFound`: 未找到指定名称的剪映草稿
             `AutomationError`: 剪映操作失败
         """
-        logger.info(f"start export {draft_name} to {output_path}")
-
-        # 初始化准备
-        self.get_window()
-        self.switch_to_home()
-
+        started = time.monotonic()
+        stage = "prepare"
         original_path = None
         export_completed = False
+        last_state = None
+        state_attempts = 0
 
-        for i in range(16):
-            # 确保窗口有焦点
-            self.__ensure_window_focus()
-            if self.app_status == "home":
-                logger.info("[%d]app is already in home page", i)
-                self.find_and_click_draft(draft_name, draft_dir=draft_dir)
-                self.retry_failed_audio_downloads(draft_dir=draft_dir)
-            elif self.app_status == "edit":
-                if export_completed or (
-                    original_path and os.path.isfile(original_path)
-                ):
-                    logger.info(
-                        "[%d]export already finished, skip re-export and return home",
-                        i,
+        def checkpoint(next_stage: str) -> None:
+            nonlocal stage
+            stage = next_stage
+            logger.info(
+                "Export stage: draft_id=%s stage=%s elapsed=%.1fs state=%s/%s "
+                "path_known=%s output_bytes=%s",
+                draft_name, stage, time.monotonic() - started,
+                getattr(self, "app_status", "unknown"), getattr(self, "app_sub_status", "none"),
+                bool(original_path), self._export_output_size(original_path),
+            )
+
+        try:
+            checkpoint("prepare")
+            self.get_window()
+            self.switch_to_home()
+            for i in range(16):
+                elapsed = time.monotonic() - started
+                if elapsed >= timeout:
+                    raise AutomationError("[EXPORT_DEADLINE] 导出流程超时：stage=%s elapsed=%.1fs" % (stage, elapsed))
+                state = (self.app_status, self.app_sub_status)
+                state_attempts = state_attempts + 1 if state == last_state else 1
+                last_state = state
+                checkpoint("observe_state")
+                if state_attempts > EXPORT_STATE_MAX_STALLS:
+                    raise AutomationError(
+                        "[EXPORT_STATE_STALLED] 界面连续%d次未推进：%s/%s；"
+                        "未移动文件，保留现场" % (EXPORT_STATE_MAX_STALLS, *state)
                     )
-                    self.return_to_home()
-                    break
-                logger.info("[%d]app is already in edit page", i)
-                # 点击导出按钮进入导出界面
-                self.click_export_button()
-            elif self.app_status == "pre_export":                
-                if self.app_sub_status == "export_start":
-                    logger.info("[%d]app is already in pre_export[export_start] page", i)
-                    # 获取原始导出路径
-                    original_path = self.get_original_export_path()
-                    # 设置分辨率（如果指定）
-                    self.set_export_resolution(resolution)                    
-                    # 设置帧率（如果指定）
-                    self.set_export_framerate(framerate)                    
-                    # 点击最终导出按钮
-                    self.click_final_export_button()
-                    # 获取窗口状态
-                    self.get_window()
-                elif self.app_sub_status == "exporting":
-                    logger.info("[%d]app is already in pre_export[exporting] page", i)
-                    if self.wait_for_export_completion(timeout, original_path):
-                        export_completed = True
-                        self.return_to_home()
+                self.__ensure_window_focus()
+                if self.app_status == "home":
+                    checkpoint("open_draft")
+                    self.find_and_click_draft(draft_name, draft_dir=draft_dir)
+                    checkpoint("prepare_audio_resources")
+                    self.retry_failed_audio_downloads(draft_dir=draft_dir)
+                elif self.app_status == "edit":
+                    checkpoint("open_export_dialog")
+                    self.click_export_button()
+                elif self.app_status == "pre_export":
+                    self._raise_if_export_resource_blocked()
+                    if self.app_sub_status == "export_start":
+                        checkpoint("read_export_path")
+                        original_path = self.get_original_export_path()
+                        if not isinstance(original_path, str) or not original_path.strip():
+                            raise AutomationError("[EXPORT_PATH_UNRESOLVED] 未取得导出路径，未启动导出")
+                        checkpoint("configure_export")
+                        self.set_export_resolution(resolution)
+                        self.set_export_framerate(framerate)
+                        checkpoint("start_export")
+                        self.click_final_export_button()
+                        self.get_window()
+                    elif self.app_sub_status == "exporting":
+                        checkpoint("wait_for_completion")
+                        remaining = max(0, timeout - (time.monotonic() - started))
+                        export_completed = self.wait_for_export_completion(remaining, original_path)
                         break
-                    self.get_window()
-                    if original_path and os.path.isfile(original_path):
-                        logger.info(
-                            "[%d]export output file exists after wait, treating as success",
-                            i,
-                        )
+                    elif self.app_sub_status == "export_succeed":
+                        checkpoint("verify_completed_output")
+                        self._require_exported_output(original_path)
                         export_completed = True
-                        self.return_to_home()
                         break
-                elif self.app_sub_status == "export_succeed":
-                    logger.info("[%d]app is already in pre_export[export_succeed] page", i)
-                    export_completed = True
-                    self.return_to_home()
-                    break
+                    else:
+                        raise AutomationError("[EXPORT_UNKNOWN_STATE] unknown export sub-status: %s" % self.app_sub_status)
                 else:
-                    raise AutomationError("[%d]app is in unknown sub-status: %s" % (i, self.app_sub_status))
-            else:
-                raise AutomationError("[%d]app is in unknown status: %s" % (i, self.app_status))
-        
-        # 移动导出文件到指定路径（如果指定）
-        self.move_exported_file(original_path, output_path)
-        
-        logger.info(f"export {draft_name} to {output_path} completed")
+                    raise AutomationError("[EXPORT_UNKNOWN_STATE] unknown app status: %s" % self.app_status)
+
+            if not export_completed:
+                raise AutomationError(
+                    "[EXPORT_INCOMPLETE] 未确认导出完成，禁止移动文件；state=%s/%s"
+                    % (self.app_status, self.app_sub_status)
+                )
+            checkpoint("verify_output")
+            self._require_exported_output(original_path)
+            checkpoint("return_to_home")
+            self.return_to_home()
+            checkpoint("move_output")
+            self.move_exported_file(original_path, output_path)
+            checkpoint("completed")
+        except Exception as exc:
+            logger.exception(
+                "Export stopped: draft_id=%s stage=%s elapsed=%.1fs state=%s/%s "
+                "path_known=%s output_bytes=%s error_type=%s; preserving app/draft",
+                draft_name, stage, time.monotonic() - started,
+                getattr(self, "app_status", "unknown"), getattr(self, "app_sub_status", "none"),
+                bool(original_path), self._export_output_size(original_path), type(exc).__name__,
+            )
+            raise
 
     def switch_to_home(self) -> None:
         """切换到剪映主页"""

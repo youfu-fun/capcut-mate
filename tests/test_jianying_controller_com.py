@@ -395,7 +395,7 @@ class TestJianying59AudioDownloadRetry:
         ):
             ctrl.retry_failed_audio_downloads()
 
-    def test_stable_export_file_closes_unrecognized_success_page(self, tmp_path) -> None:
+    def test_stable_export_file_does_not_close_unrecognized_page(self, tmp_path) -> None:
         output = tmp_path / "export.mp4"
         output.write_bytes(b"video")
         ctrl = JianyingController.__new__(JianyingController)
@@ -404,11 +404,14 @@ class TestJianying59AudioDownloadRetry:
         with (
             patch.object(ctrl, "get_window"),
             patch.object(ctrl, "_find_export_succeed_close_btn", return_value=None),
-            patch("src.pyJianYingDraft.jianying_controller.time.time", return_value=0),
+            patch.object(ctrl, "_raise_if_export_resource_blocked"),
+            patch("src.pyJianYingDraft.jianying_controller.time.monotonic", side_effect=[0, 0, 4, 8, 12]),
             patch("src.pyJianYingDraft.jianying_controller.time.sleep"),
             patch("src.pyJianYingDraft.jianying_controller.pyautogui.press") as press,
+            patch("src.pyJianYingDraft.jianying_controller.pyautogui.click") as click,
+            pytest.raises(Exception, match="EXPORT_COMPLETION_TIMEOUT"),
         ):
-            completed = ctrl.wait_for_export_completion(10, str(output))
+            ctrl.wait_for_export_completion(10, str(output))
 
-        assert completed is True
-        press.assert_called_once_with("esc")
+        press.assert_not_called()
+        click.assert_not_called()
