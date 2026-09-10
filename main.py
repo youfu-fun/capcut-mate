@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -21,10 +21,17 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        from src.utils.video_task_manager import task_manager
+
+        # 先停止接单并通知执行子进程退出，最后确认 worker 清理完毕。
+        # 不使用 to_thread(stop)：退出路径不能再次依赖被阻塞的线程池。
+        task_manager.request_stop()
         for bg_task in (cleanup_task, deferred_delete_task):
             bg_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await bg_task
+        try:
+            await asyncio.gather(cleanup_task, deferred_delete_task, return_exceptions=True)
+        finally:
+            await task_manager.astop()
 
 
 # 1. 创建 FastAPI 应用

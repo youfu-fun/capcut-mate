@@ -91,6 +91,13 @@ LOGGING_CONFIG = {
     },
 }
 
+# Windows 多个进程不可共同轮转同一个日志文件。阶段子进程继承控制台，
+# 由同一终端/日志采集器接收；父进程仍记录任务阶段、终态及错误到文件。
+if os.getenv("CAPCUT_MATE_PHASE_WORKER") == "1":
+    LOGGING_CONFIG["handlers"].pop("file", None)
+    for _logger_config in LOGGING_CONFIG["loggers"].values():
+        _logger_config["handlers"] = ["default"]
+
 dictConfig(LOGGING_CONFIG)
 
 

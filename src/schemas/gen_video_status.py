@@ -20,3 +20,7 @@ class GenVideoStatusResponse(BaseModel):
     created_at: Optional[str] = Field(default=None, description="任务创建时间")
     started_at: Optional[str] = Field(default=None, description="任务开始时间")
     completed_at: Optional[str] = Field(default=None, description="任务完成时间")
+    phase: Optional[str] = Field(default=None, description="当前阶段；进度为阶段进度，不是视频编码百分比")
+    phase_started_at: Optional[str] = Field(default=None, description="当前阶段开始时间")
+    queue_position: Optional[int] = Field(default=None, description="已下载、等待 RPA 的队列序号，从 1 开始")
+    node_error: str = Field(default="", description="剪映节点异常原因；恢复到首页后新请求会重新探测")

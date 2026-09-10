@@ -5,18 +5,19 @@
 import asyncio
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from src.utils.logger import logger
 from src.utils import helper
-from src.utils.deferred_delete import enqueue_path, enqueue_paths
+from src.utils.deferred_delete import dequeue_path, enqueue_path, enqueue_paths
+from src.utils.isolated_process import IsolatedProcessRunner, ProcessTimedOut
+from src.utils.video_phase_process import run_video_phase
 from src.utils.video_task_store import (
     get_completed_by_draft_id,
     prune_if_needed,
-    save_completed_result,
+    save_completed_results_batch,
 )
 import src.pyJianYingDraft as draft
 import config
@@ -24,15 +25,21 @@ import os
 import sys
 import subprocess
 import json
+import time
 
 # draft_content.json 中 duration 为微秒；低于 3 秒视为空草稿，不进入剪映导出
 MIN_DRAFT_EXPORT_DURATION_US = 3 * 1_000_000
 
-# gen_video：同时下载草稿的最大并发，超出部分在 _download_executor 队列中排队
+# gen_video：同时下载草稿的最大并发，超出部分以协程等待，不占执行线程
 DRAFT_DOWNLOAD_MAX_CONCURRENT = 3
 
-# gen_video：上传到对象存储的最大并发，超出部分在 _upload_executor 队列中排队
+# gen_video：上传到对象存储的最大并发
 OBJECT_STORAGE_UPLOAD_MAX_CONCURRENT = 2
+
+# 所有截止时间由父进程计时，包含控制器初始化及卡死的 COM 调用。
+PHASE_TIMEOUT_SECONDS = {"download": 900.0, "probe": 15.0, "export": 360.0, "upload": 600.0}
+MAX_IN_FLIGHT_TASKS = 32
+SHUTDOWN_TIMEOUT_SECONDS = 15.0
 
 # 路径未取得是导出状态契约失败，重复整个 UI 流程不会补齐证据。
 # 保留常量供兼容调用，但不再对 rename None 重试。
@@ -78,15 +85,16 @@ class VideoGenTask:
     api_key: Optional[str] = None  # 存储API密钥用于计费
     outfile: str = ""  # 导出目标路径，在下载阶段生成
     export_outfile_history: List[str] = field(default_factory=list)  # 含重试产生的历史路径
+    phase: str = "queued"
+    phase_started_at: Optional[datetime] = None
+    node_generation: int = 0
 
 
 class VideoGenTaskManager:
     """视频生成任务管理器 - 单例模式
 
-    每个任务在独立协程中执行：草稿下载由专用线程池执行，并发上限为
-    DRAFT_DOWNLOAD_MAX_CONCURRENT，超出部分在线程池队列中排队；
-    剪映 RPA 导出由 export_video_lock 全局串行；COS/OSS/TOS 上传在独立线程池中执行，
-    并发上限为 OBJECT_STORAGE_UPLOAD_MAX_CONCURRENT。
+    父进程负责队列与状态；下载、RPA、上传分别在受监管子进程内执行。
+    异步信号量限制 3/1/2 并发，等待任务不占用线程；每台桌面仅运行一个服务进程。
     """
     
     _instance = None
@@ -109,39 +117,37 @@ class VideoGenTaskManager:
         # 跨线程任务队列（HTTP 线程 put、worker 线程 get）。不能用 asyncio.Queue：其在 __init__
         # 时绑定的 loop 与 worker 内 new_event_loop() 不一致，会触发 “bound to a different event loop”。
         self.task_queue: queue.Queue = queue.Queue()
-        _download_workers = DRAFT_DOWNLOAD_MAX_CONCURRENT
-        _upload_workers = OBJECT_STORAGE_UPLOAD_MAX_CONCURRENT
-        self._download_executor = ThreadPoolExecutor(
-            max_workers=_download_workers,
-            thread_name_prefix="draft_dl",
-        )
-        self._upload_executor = ThreadPoolExecutor(
-            max_workers=_upload_workers,
-            thread_name_prefix="cos_upload",
-        )
-        # 导出视频专用锁（确保任何时候只有一个线程执行剪映 RPA 导出）
+        # 同步方法仍供子进程及既有单元测试调用；父进程不在此锁上排队。
         self.export_video_lock = threading.Lock()
-        # 有多少个线程已进入「仅导出」阶段（含在 export_video_lock 上阻塞等待），用于对照默认线程池挤占
         self._export_metrics_lock = threading.Lock()
         self._export_phase_active = 0
         # 工作线程
         self.worker_thread: Optional[threading.Thread] = None
         # 停止标志
         self.stop_flag = threading.Event()
-
-        _default_asyncio_pool = min(32, (os.cpu_count() or 1) + 4)
+        self._lifecycle_lock = threading.RLock()
+        self._worker_event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._in_flight: set[asyncio.Task] = set()
+        self._task_coroutines: Dict[asyncio.Task, VideoGenTask] = {}
+        self._process_runner = IsolatedProcessRunner()
+        self._node_generation = 0
+        self._node_error = ""
+        self._worker_failure: Optional[BaseException] = None
+        self._shutdown_results: Dict[str, Dict[str, Any]] = {}
+        self._next_persist_at = 0.0
         logger.info(
-            "VideoGenTaskManager initialized: draft_dl max_workers=%s (queued beyond that), "
-            "cos_upload max_workers=%s (queued beyond that). Jianying export uses run_in_executor(None) "
-            "and shares the asyncio default thread pool with sync FastAPI routes "
-            "(typical cap min(32, cpu+4)=%s). When export-phase concurrency reaches that level, "
-            "synchronous HTTP handlers may stall.",
-            _download_workers,
-            _upload_workers,
-            _default_asyncio_pool,
+            "VideoGenTaskManager initialized: isolated subprocesses; "
+            "download concurrency=%s, RPA concurrency=1, upload concurrency=%s",
+            DRAFT_DOWNLOAD_MAX_CONCURRENT, OBJECT_STORAGE_UPLOAD_MAX_CONCURRENT,
         )
     
     def submit_task(self, draft_url: str, api_key: str = None) -> None:
+        with self._lifecycle_lock:
+            if self.stop_flag.is_set():
+                raise RuntimeError("[SERVICE_STOPPING] 服务正在停止，不再接收导出任务")
+            self._submit_task(draft_url, api_key)
+
+    def _submit_task(self, draft_url: str, api_key: str = None) -> None:
         """
         提交视频生成任务
         
@@ -167,7 +173,8 @@ class VideoGenTaskManager:
             draft_id=draft_id,
             status=TaskStatus.PENDING,
             created_at=datetime.now(),
-            api_key=api_key  # 存储API密钥用于计费
+            api_key=api_key,  # 存储API密钥用于计费
+            node_generation=self._node_generation,
         )
         
         # 存储任务
@@ -207,6 +214,10 @@ class VideoGenTaskManager:
                 "created_at": task.created_at.isoformat(),
                 "started_at": task.started_at.isoformat() if task.started_at else None,
                 "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                "phase": task.phase,
+                "phase_started_at": task.phase_started_at.isoformat() if task.phase_started_at else None,
+                "queue_position": self._export_queue_position(task),
+                "node_error": self._node_error,
             }
 
         prune_if_needed()
@@ -219,12 +230,24 @@ class VideoGenTaskManager:
         不含已完成(completed)、失败(failed)。
         """
         active = (TaskStatus.PENDING, TaskStatus.PROCESSING)
-        return sum(1 for t in self.tasks.values() if t.status in active)
+        with self._lifecycle_lock:
+            return sum(1 for t in self.tasks.values() if t.status in active)
+
+    def _export_queue_position(self, task: VideoGenTask) -> Optional[int]:
+        if task.phase != "waiting_export":
+            return None
+        with self._lifecycle_lock:
+            waiting = sorted(
+                (t for t in self.tasks.values() if t.phase == "waiting_export"),
+                key=lambda t: t.phase_started_at or t.created_at,
+            )
+        return next((i for i, t in enumerate(waiting, 1) if t is task), None)
 
     def _ensure_worker_running(self):
         """确保工作线程正在运行"""
         if self.worker_thread is None or not self.worker_thread.is_alive():
-            self.stop_flag.clear()
+            if self.stop_flag.is_set():
+                raise RuntimeError("[SERVICE_STOPPING] 任务管理器已停止，请重新启动服务")
             self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self.worker_thread.start()
             logger.info("Worker thread started")
@@ -236,88 +259,191 @@ class VideoGenTaskManager:
         # 在工作线程中创建新的事件循环
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+        self._worker_event_loop = loop
+        self._download_slots = asyncio.Semaphore(DRAFT_DOWNLOAD_MAX_CONCURRENT)
+        self._export_slot = asyncio.Semaphore(1)
+        self._upload_slots = asyncio.Semaphore(OBJECT_STORAGE_UPLOAD_MAX_CONCURRENT)
         try:
             loop.run_until_complete(self._async_worker_loop())
+        except BaseException as exc:
+            self._worker_failure = exc
+            self.stop_flag.set()
+            logger.exception("Video worker shutdown failed: %r", exc)
         finally:
+            self._worker_event_loop = None
             loop.close()
     
     async def _async_worker_loop(self):
-        """从队列取任务并启动独立协程；下载/上传并发受各自线程池限制，导出串行。"""
-        while not self.stop_flag.is_set():
+        """队列消费不依赖任何线程池，RPA 卡死也能响应停止。"""
+        try:
+            while not self.stop_flag.is_set():
+                while len(self._in_flight) < MAX_IN_FLIGHT_TASKS and not self.stop_flag.is_set():
+                    try:
+                        task = self.task_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if task.status in (TaskStatus.FAILED, TaskStatus.COMPLETED):
+                        self.task_queue.task_done()
+                        continue
+                    t = asyncio.create_task(self._process_task(task))
+                    self._in_flight.add(t)
+                    self._task_coroutines[t] = task
+                    t.add_done_callback(self._log_async_task_done)
+                    self.task_queue.task_done()
+                if self._shutdown_results and time.monotonic() >= self._next_persist_at:
+                    self._flush_shutdown_results()
+                await asyncio.sleep(0.05)
+        finally:
+            pending = list(self._in_flight)
+            for t in pending:
+                if not t.cancelling():
+                    t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             try:
-                # Blocking get with timeout on thread pool — queue is thread-safe, not loop-bound.
-                task = await asyncio.to_thread(self.task_queue.get, True, 1.0)
-                t = asyncio.create_task(self._process_task(task))
-                t.add_done_callback(self._log_async_task_done)
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Worker loop error: {e}")
-                await asyncio.sleep(1)
+                await self._process_runner.stop()
+            finally:
+                with self._lifecycle_lock:
+                    unfinished = [t for t in self.tasks.values()
+                                  if t.status in (TaskStatus.PENDING, TaskStatus.PROCESSING)]
+                for task in unfinished:
+                    self._fail_task(task, "[SERVICE_STOPPING] 服务停止，任务已取消；草稿已保留")
+                self._flush_shutdown_results()
+                while not self.task_queue.empty():
+                    try:
+                        self.task_queue.get_nowait()
+                        self.task_queue.task_done()
+                    except queue.Empty:
+                        break
 
     def _log_async_task_done(self, fut: asyncio.Task) -> None:
+        self._in_flight.discard(fut)
+        task = self._task_coroutines.pop(fut, None)
         try:
             fut.result()
         except asyncio.CancelledError:
-            pass
+            if task is not None:
+                self._fail_task(task, task.error_message or "[SERVICE_STOPPING] 服务停止，任务已取消")
         except Exception as e:
             logger.exception(f"Async task finished with error: {e}")
 
     def _persist_terminal_task(self, task: VideoGenTask) -> None:
-        """将已完成或失败的任务写入 SQLite（仅终态）。"""
+        """终态先入批量队列；取消回调内不逐条等待数据库锁。"""
         if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             return
         task.completed_at = datetime.now()
+        self._shutdown_results[task.draft_id] = {
+            "draft_id": task.draft_id, "draft_url": task.draft_url,
+            "status": task.status.value, "progress": task.progress,
+            "video_url": task.video_url, "error_message": task.error_message,
+            "created_at": task.created_at, "started_at": task.started_at,
+            "completed_at": task.completed_at,
+        }
+
+    def _flush_shutdown_results(self) -> None:
+        """批量短等待落库；停止时仅在执行进程清理完毕后调用。"""
+        if not self._shutdown_results:
+            return
         try:
-            save_completed_result(
-                draft_id=task.draft_id,
-                draft_url=task.draft_url,
-                status=task.status.value,
-                progress=task.progress,
-                video_url=task.video_url,
-                error_message=task.error_message,
-                created_at=task.created_at,
-                started_at=task.started_at,
-                completed_at=task.completed_at,
-            )
-        except Exception as persist_err:
-            logger.exception(
-                "Failed to persist video gen task result: %s", persist_err
-            )
+            save_completed_results_batch(list(self._shutdown_results.values()))
+            self._shutdown_results.clear()
+        except Exception as exc:
+            self._next_persist_at = time.monotonic() + 1.0
+            if self.stop_flag.is_set():
+                logger.error(
+                    "Shutdown task persistence failed; %s terminal results remain only "
+                    "in memory and will not survive exit: %r",
+                    len(self._shutdown_results), exc,
+                )
+            else:
+                logger.warning("Terminal task persistence deferred; count=%s error=%r",
+                               len(self._shutdown_results), exc)
 
     async def _run_upload_and_finalize(self, task: VideoGenTask) -> None:
-        """导出成功后的上传与落库；上传受 _upload_executor 并发上限约束，绑定本 task 的 outfile/draft_id。"""
-        loop = asyncio.get_running_loop()
+        """上传也有硬截止时间，停止服务不等待 SDK 线程；不自动重试计费。"""
+        self._set_phase(task, "waiting_upload")
         try:
-            video_url, error_message = await loop.run_in_executor(
-                self._upload_executor,
-                self._phase_cos_upload_finalize,
-                task,
-            )
+            async with self._upload_slots:
+                self._raise_if_stopping()
+                self._set_phase(task, "uploading")
+                video_url, error_message = await self._run_phase(task, "upload")
+            self._raise_if_stopping()
             if video_url:
                 task.status = TaskStatus.COMPLETED
                 task.video_url = video_url
                 task.progress = 100
-                logger.info(f"Task completed successfully: {task.draft_url}")
+                self._set_phase(task, "completed")
+                # 子进程中的延迟删除队列不共享；仅父进程安排清理。
+                self._cleanup_files(task)
+                self._persist_terminal_task(task)
             else:
-                task.status = TaskStatus.FAILED
-                task.error_message = error_message
-                task.progress = 0
-                logger.error(f"Task failed: {task.draft_url}, error: {error_message}")
+                self._fail_task(task, error_message or "[UPLOAD_FAILED] 视频上传失败")
         except Exception as e:
-            task.status = TaskStatus.FAILED
-            task.error_message = str(e)
-            task.progress = 0
-            logger.exception(f"Upload/finalize exception: {task.draft_url}, error: {e}")
-            self._cleanup_files(task)
-        finally:
-            self._persist_terminal_task(task)
+            self._fail_task(task, f"[UPLOAD_FAILED] {e}；上传/扣费结果可能未确认，未自动重试")
+
+    @staticmethod
+    def _set_phase(task: VideoGenTask, phase: str) -> None:
+        task.phase = phase
+        task.phase_started_at = datetime.now()
+        logger.info("Video task phase: draft_id=%s phase=%s", task.draft_id, phase)
+
+    def _raise_if_stopping(self) -> None:
+        if self.stop_flag.is_set():
+            raise asyncio.CancelledError()
+
+    def _fail_task(self, task: VideoGenTask, message: str) -> None:
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            return
+        task.status = TaskStatus.FAILED
+        task.error_message = message
+        task.progress = 0
+        self._set_phase(task, "failed")
+        # 失败/取消保留草稿及可能仍由剪映写入的输出，不擅自删除现场。
+        self._persist_terminal_task(task)
+
+    def _mark_node_unready(self, message: str) -> None:
+        with self._lifecycle_lock:
+            self._node_error = message
+            self._node_generation += 1
+            previous = [t for t in self.tasks.values()
+                        if t.node_generation < self._node_generation
+                        and t.status in (TaskStatus.PENDING, TaskStatus.PROCESSING)
+                        and t.phase not in ("waiting_upload", "uploading")]
+        current = asyncio.current_task()
+        running = {id(task): coro for coro, task in self._task_coroutines.items()}
+        reason = "[RPA_NODE_NOT_READY] 前一个导出异常，排队任务已停止；请恢复剪映首页后重新提交。" + message
+        for task in previous:
+            coro = running.get(id(task))
+            if coro is current:
+                continue
+            task.error_message = reason
+            if coro is not None and not coro.done():
+                if not coro.cancelling():
+                    coro.cancel()
+            else:
+                self._fail_task(task, reason)
+
+    def _check_node_generation(self, task: VideoGenTask) -> None:
+        if task.node_generation < self._node_generation:
+            raise RuntimeError(
+                "[RPA_NODE_NOT_READY] 前一个导出异常，当前排队任务已停止；"
+                "请将剪映恢复到首页后重新提交。" + self._node_error
+            )
+
+    async def _run_phase(self, task: VideoGenTask, phase: str):
+        self._raise_if_stopping()
+        try:
+            return await run_video_phase(
+                self._process_runner, task, phase, PHASE_TIMEOUT_SECONDS[phase]
+            )
+        except ProcessTimedOut as exc:
+            raise RuntimeError(
+                f"[{phase.upper()}_TIMEOUT] {phase} 阶段超过 {exc.timeout:g} 秒，"
+                "执行子进程已终止；未关闭剪映，草稿已保留"
+            ) from exc
 
     async def _process_task(self, task: VideoGenTask):
         """
-        单任务流水线：下载阶段受 _download_executor 并发上限约束；导出串行（export_video_lock）；
-        成功后上传统一异步且不阻塞本循环（上传受 _upload_executor 限制）。
+        等待阶段仅占协程；所有同步执行受子进程截止时间约束。
         """
         logger.info(f"Processing task: {task.draft_url}")
 
@@ -325,51 +451,47 @@ class VideoGenTaskManager:
         task.started_at = datetime.now()
         task.progress = 10
 
-        loop = asyncio.get_running_loop()
-
         try:
-            prep_error = await loop.run_in_executor(
-                self._download_executor,
-                self._phase_download_and_prepare,
-                task,
-            )
+            self._check_node_generation(task)
+            self._set_phase(task, "waiting_download")
+            async with self._download_slots:
+                self._raise_if_stopping()
+                self._check_node_generation(task)
+                self._set_phase(task, "downloading")
+                # 延迟删除是父进程内队列，不能只在下载子进程里取消。
+                dequeue_path(os.path.join(config.DRAFT_SAVE_PATH, task.draft_id))
+                prep_error = await self._run_phase(task, "download")
             if prep_error:
-                task.status = TaskStatus.FAILED
-                task.error_message = prep_error
-                task.progress = 0
-                logger.error(f"Task failed: {task.draft_url}, error: {prep_error}")
-                self._cleanup_files(task)
-                self._persist_terminal_task(task)
+                self._fail_task(task, prep_error)
                 return
-
-            export_error = await loop.run_in_executor(
-                None,
-                self._phase_export_only,
-                task,
-            )
-            if export_error:
-                task.status = TaskStatus.FAILED
-                task.error_message = export_error
-                task.progress = 0
-                logger.error(
-                    "Task failed: draft_id=%s, error=%s",
-                    task.draft_id,
-                    export_error,
-                )
-                self._cleanup_files(task, preserve_draft=True)
-                self._persist_terminal_task(task)
-                return
-
-            ut = asyncio.create_task(self._run_upload_and_finalize(task))
-            ut.add_done_callback(self._log_async_task_done)
-
+            self._set_phase(task, "waiting_export")
+            async with self._export_slot:
+                self._raise_if_stopping()
+                self._check_node_generation(task)
+                try:
+                    # 即使服务重启也先确认主页；不盲目关闭前一次弹窗/导出。
+                    self._set_phase(task, "checking_node")
+                    if not await self._run_phase(task, "probe"):
+                        raise RuntimeError("[RPA_NODE_NOT_READY] 剪映未就绪，请恢复到首页后重试")
+                    self._node_error = ""
+                    self._set_phase(task, "exporting")
+                    export_error = await self._run_phase(task, "export")
+                    if export_error:
+                        raise RuntimeError(export_error)
+                    if not task.outfile or not os.path.isfile(task.outfile) or os.path.getsize(task.outfile) <= 0:
+                        raise RuntimeError("[EXPORT_OUTPUT_MISSING] 导出完成但没有有效输出文件")
+                except Exception as exc:
+                    self._mark_node_unready(str(exc))
+                    raise
+            await self._run_upload_and_finalize(task)
+        except asyncio.CancelledError:
+            message = task.error_message or "[SERVICE_STOPPING] 服务停止，任务已取消；草稿已保留"
+            if task.phase == "uploading":
+                message += "；上传/扣费结果未确认，未自动重试"
+            self._fail_task(task, message)
+            raise
         except Exception as e:
-            task.status = TaskStatus.FAILED
-            task.error_message = str(e)
-            task.progress = 0
-            logger.exception(f"Task exception: {task.draft_url}, error: {e}")
-            self._cleanup_files(task, preserve_draft=True)
-            self._persist_terminal_task(task)
+            self._fail_task(task, str(e))
     
     def _check_draft_duration(self, task: VideoGenTask) -> bool:
         """
@@ -526,7 +648,7 @@ class VideoGenTaskManager:
 
     def _phase_export_only(self, task: VideoGenTask) -> str:
         """
-        仅执行剪映导出（在 export_video_lock 内，全局串行）。
+        在受监管子进程内同步执行剪映导出；全局串行由父进程信号量保证。
         只重试瞬时 COM/UIA 错误。路径缺失、状态停滞、导出不完整等确定性
         失败立即返回，避免重复整套导出流程掩盖最早失败阶段。
 
@@ -587,8 +709,8 @@ class VideoGenTaskManager:
 
     def _phase_cos_upload_finalize(self, task: VideoGenTask) -> Tuple[str, str]:
         """
-        COS 上传、扣费与清理（与其它任务的上传共享线程池，最多 2 路并发）。
-        草稿目录与本地导出 mp4 在 finally 中清理，避免上传/扣费任一环节抛错导致残留。
+        子进程内同步上传和扣费，最多 2 路并发由父进程限制。
+        子进程的延迟删除队列不共享；最终文件清理由父进程在确认成功后执行。
         """
         try:
             task.progress = 95
@@ -857,15 +979,43 @@ class VideoGenTaskManager:
         # 返回上传后的URL，扣费结果不阻塞视频生成
         return upload_url, ""
     
-    def stop(self):
-        """停止任务管理器"""
-        logger.info("Stopping VideoGenTaskManager")
-        self.stop_flag.set()
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=5)
-        self._download_executor.shutdown(wait=False)
-        self._upload_executor.shutdown(wait=False)
+    def request_stop(self) -> None:
+        """线程安全：停止接单，唤醒 worker 取消所有正在等待/执行的阶段。"""
+        with self._lifecycle_lock:
+            self.stop_flag.set()
+            loop = self._worker_event_loop
+            if loop is not None and not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(self._cancel_in_flight)
+                except RuntimeError:
+                    pass  # loop 已经完成退出
+
+    def _cancel_in_flight(self) -> None:
+        for task in list(self._in_flight):
+            if not task.cancelling():
+                task.cancel()
+
+    def stop(self, timeout: float = SHUTDOWN_TIMEOUT_SECONDS) -> None:
+        """同步调用方使用；不可在 worker 自己的线程上 join。"""
+        self.request_stop()
+        worker = self.worker_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=timeout)
+            if worker.is_alive():
+                raise RuntimeError("[SHUTDOWN_TIMEOUT] 未能确认所有执行进程已停止")
+        if self._worker_failure is not None:
+            raise RuntimeError("[SHUTDOWN_FAILED] 执行进程清理失败") from self._worker_failure
         logger.info("VideoGenTaskManager stopped")
+
+    async def astop(self, timeout: float = SHUTDOWN_TIMEOUT_SECONDS) -> None:
+        """FastAPI 生命周期使用，不在事件循环内阻塞 join 或引入退出等待线程。"""
+        self.request_stop()
+        deadline = time.monotonic() + timeout
+        while self.worker_thread is not None and self.worker_thread.is_alive():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("[SHUTDOWN_TIMEOUT] 未能确认所有执行进程已停止")
+            await asyncio.sleep(0.05)
+        self.stop(timeout=0)
 
 
 # 全局任务管理器实例
