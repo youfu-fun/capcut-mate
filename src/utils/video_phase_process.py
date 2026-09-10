@@ -25,6 +25,11 @@ PHASES = frozenset({"download", "export", "upload", "probe"})
 PROTOCOL_VERSION = 1
 MAX_DOCUMENT_BYTES = 256 * 1024
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+CHILD_ERROR_CODES = frozenset({
+    "VIDEO_PHASE_CHILD_FAILED", "VIDEO_PHASE_BOOTSTRAP_FAILED",
+    "VIDEO_PHASE_PARENT_MISMATCH", "VIDEO_PHASE_PRIVATE_PATHS_INVALID",
+    "VIDEO_PHASE_REQUEST_INVALID",
+})
 
 
 class VideoPhaseProtocolError(RuntimeError):
@@ -168,13 +173,24 @@ async def run_video_phase(runner: Any, task: Any, phase: str, timeout: float) ->
                 # Set this in the child environment to avoid shared file rotation.
                 env={**os.environ, "CAPCUT_MATE_PHASE_WORKER": "1"},
             )
-        except BaseException:
+        except BaseException as exc:
             # Preserve the latest owned paths even when the last poll raced with
             # a timeout. A broken status must not hide cancellation/timeout.
             try:
                 _apply_status(status_path, request, task)
             except VideoPhaseProtocolError:
                 pass
+            from src.utils.isolated_process import ProcessFailed
+            if isinstance(exc, ProcessFailed):
+                try:
+                    failed = _read_json(result_path)
+                    _check_identity(failed, request)
+                    code = failed.get("error")
+                    if failed.get("ok") is False and isinstance(code, str) and code in CHILD_ERROR_CODES:
+                        raise VideoPhaseProtocolError(code) from exc
+                except VideoPhaseProtocolError as protocol_error:
+                    if str(protocol_error) in CHILD_ERROR_CODES:
+                        raise
             raise
         _apply_status(status_path, request, task, required=True)
         result = _read_json(result_path)
@@ -237,7 +253,10 @@ def _start_parent_watchdog(parent_pid: int) -> None:
                 time.sleep(0.5)
             os._exit(70)
 
-    if os.getppid() != parent_pid:
+    # Windows venv python.exe is a redirector: the interpreter's immediate
+    # parent may be that launcher, rather than the server. Monitor the explicit
+    # server handle above; do not reject a valid launcher ancestry here.
+    if sys.platform != "win32" and os.getppid() != parent_pid:
         raise VideoPhaseProtocolError("VIDEO_PHASE_PARENT_MISMATCH")
     threading.Thread(target=watch_parent, name="video-phase-parent-watch", daemon=True).start()
 
@@ -343,14 +362,21 @@ def main(argv: list[str] | None = None) -> int:
     if len(arguments) != 3:
         return 2
     request_path, status_path, result_path = map(Path, arguments)
+    private_paths_valid = False
     try:
         request = _read_json(request_path)
         _validate_request(request)
         if (not (request_path.parent == status_path.parent == result_path.parent)
                 or len({request_path, status_path, result_path}) != 3):
             raise VideoPhaseProtocolError("VIDEO_PHASE_PRIVATE_PATHS_INVALID")
+        private_paths_valid = True
         _start_parent_watchdog(request["parent_pid"])
-    except Exception:
+    except Exception as exc:
+        if private_paths_valid:
+            code = str(exc) if isinstance(exc, VideoPhaseProtocolError) else "VIDEO_PHASE_BOOTSTRAP_FAILED"
+            if code not in CHILD_ERROR_CODES:
+                code = "VIDEO_PHASE_BOOTSTRAP_FAILED"
+            _atomic_json(result_path, {**_identity(request), "ok": False, "error": code})
         return 2
     try:
         value = _execute_request(request, status_path)

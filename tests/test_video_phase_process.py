@@ -308,14 +308,47 @@ def test_probe_fail_closed_on_uia_error():
 
 def test_watchdog_rejects_wrong_parent_before_starting_thread(monkeypatch):
     started = []
+    monkeypatch.setattr(bridge.sys, "platform", "linux")
     monkeypatch.setattr(bridge.threading, "Thread", lambda **kwargs: started.append(kwargs))
     with pytest.raises(bridge.VideoPhaseProtocolError, match="PARENT_MISMATCH"):
         bridge._start_parent_watchdog(os.getppid() + 1)
     assert not started
 
 
+@pytest.mark.asyncio
+async def test_child_bootstrap_error_is_returned_instead_of_bare_exit_code(tmp_path):
+    from src.utils.isolated_process import ProcessFailed
+
+    class FailedRunner:
+        async def run(self, command, **kwargs):
+            _, _, result_path = map(Path, command[-3:])
+            request = bridge._read_json(Path(command[-3]))
+            bridge._atomic_json(result_path, {
+                **bridge._identity(request), "ok": False,
+                "error": "VIDEO_PHASE_PARENT_MISMATCH",
+            })
+            raise ProcessFailed(123, 2)
+
+    with pytest.raises(bridge.VideoPhaseProtocolError, match="VIDEO_PHASE_PARENT_MISMATCH"):
+        await bridge.run_video_phase(FailedRunner(), make_task(tmp_path), "download", 10)
+
+
+def test_bootstrap_failure_records_safe_reason(tmp_path, monkeypatch):
+    request = make_request(make_task(tmp_path))
+    request_path, status_path, result_path = (tmp_path / name for name in ("request", "status", "result"))
+    bridge._atomic_json(request_path, request)
+    def mismatch(parent_pid):
+        raise bridge.VideoPhaseProtocolError("VIDEO_PHASE_PARENT_MISMATCH")
+    monkeypatch.setattr(bridge, "_start_parent_watchdog", mismatch)
+    assert bridge.main([str(request_path), str(status_path), str(result_path)]) == 2
+    result = bridge._read_json(result_path)
+    assert result["error"] == "VIDEO_PHASE_PARENT_MISMATCH"
+    assert request["task"]["api_key"] not in result_path.read_text()
+
+
 @pytest.mark.parametrize("handle", [0, 4242])
-def test_windows_watchdog_waits_on_owned_parent_and_exits_only_child(monkeypatch, handle):
+@pytest.mark.parametrize("immediate_parent", [12345, 54321])
+def test_windows_watchdog_waits_on_owned_parent_and_exits_only_child(monkeypatch, handle, immediate_parent):
     import ctypes
 
     class ChildExited(BaseException):
@@ -343,7 +376,7 @@ def test_windows_watchdog_waits_on_owned_parent_and_exits_only_child(monkeypatch
 
     monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32, raising=False)
     monkeypatch.setattr(bridge.sys, "platform", "win32")
-    monkeypatch.setattr(bridge.os, "getppid", lambda: 12345)
+    monkeypatch.setattr(bridge.os, "getppid", lambda: immediate_parent)
     monkeypatch.setattr(bridge.os, "_exit", exit_child)
     monkeypatch.setattr(
         bridge.threading, "Thread",
