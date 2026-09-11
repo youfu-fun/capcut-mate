@@ -394,6 +394,15 @@ def _resume_request_headers(local_path: str) -> Tuple[Optional[Dict[str, str]], 
     size = _local_file_size(local_path)
     if size <= 0:
         return None, 0
+    if _is_media_resource(local_path):
+        with open(local_path, "rb") as stream:
+            prefix = stream.read(512).lstrip()
+        # Older response middleware saved HTTP error JSON as a media file.
+        # Do not append valid bytes to that poisoned prefix on retry.
+        if prefix.startswith(b'{') and b'"code"' in prefix and b'"message"' in prefix:
+            logger.warning("Discarding cached error response before media retry: %s", local_path)
+            _remove_local_file(local_path)
+            return None, 0
     return {"Range": f"bytes={size}-"}, size
 
 
@@ -467,6 +476,13 @@ def _write_http_body_to_file(
     append=True：断点续传，在已有内容后追加（配合 206）。
     append=False：覆盖写入（JSON 等非资源，或服务端忽略 Range 返回 200 时的整文件重下）。
     """
+    content_type = str(response.headers.get("Content-Type", "")).lower()
+    if _is_media_resource(file_path) and ("json" in content_type or "text/html" in content_type):
+        _abort(
+            DraftDownloadFailureKind.RESOURCE_UNAVAILABLE,
+            detail="Media download returned JSON/HTML instead of media bytes",
+            url=file_path,
+        )
     parent_dir = os.path.dirname(file_path)
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)

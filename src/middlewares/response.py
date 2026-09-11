@@ -21,6 +21,14 @@ class ResponseMiddleware(BaseHTTPMiddleware):
             lang = self._get_language_from_request(request)
             response = await call_next(request)
 
+            # StaticFiles owns file/range semantics (206/304/416 included).
+            # Never consume binary streams or turn download errors into HTTP 200.
+            if request.url.path.startswith('/output/'):
+                return response
+
+            if 200 <= response.status_code < 300 and response.status_code != 200:
+                return response
+
             # 处理非200状态码的响应
             if response.status_code != 200:
                 return await self._handle_non_200_response(response, lang)
