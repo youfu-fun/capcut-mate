@@ -289,7 +289,6 @@ def test_probe_unique_homepage_without_any_ui_mutation_methods():
     [home(), control(name="导出", class_name="ExportDialog")],
     [home(enabled=False)],
     [home(children=[control(class_name="PopupDialog")])],
-    [home(children=[control(type_name="WindowControl")])],
 ])
 def test_probe_rejects_editor_export_modal_or_ambiguous_desktop(roots):
     assert probe(*roots) is False
@@ -297,6 +296,40 @@ def test_probe_rejects_editor_export_modal_or_ambiguous_desktop(roots):
 
 def test_probe_ignores_hidden_editor_but_not_a_visible_one():
     assert probe(home(), control(class_name="MainWindow", offscreen=True)) is True
+
+
+def test_homepage_qt_window_containers_are_not_assumed_to_be_dialogs():
+    content = control(class_name="QQuickWindow", type_name="WindowControl")
+    auxiliary = control(class_name="QQuickWindow", type_name="WindowControl")
+    assert probe(home(children=[content]), auxiliary) is True
+
+
+def test_explicit_modal_window_is_still_blocked():
+    modal = control(class_name="QQuickWindow", type_name="WindowControl")
+    modal.GetWindowPattern = lambda: SimpleNamespace(IsModal=True)
+    assert probe(home(children=[modal])) is False
+
+
+def test_unrelated_app_offscreen_error_does_not_block_jianying_home():
+    class OtherApp:
+        Name = "Other app"
+        ProcessId = 200
+        @property
+        def IsOffscreen(self):
+            raise RuntimeError("unrelated provider unavailable")
+    assert probe(home(), OtherApp()) is True
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_exposes_specific_reason(tmp_path):
+    with pytest.raises(bridge.VideoPhaseProtocolError, match="匹配数量=0"):
+        await bridge.run_video_phase(
+            FakeRunner({"ready": False, "reason": "匹配数量=0"}),
+            make_task(tmp_path), "probe", 10,
+        )
+    assert await bridge.run_video_phase(
+        FakeRunner({"ready": True, "reason": "ready"}), make_task(tmp_path), "probe", 10,
+    ) is True
 
 
 def test_probe_fail_closed_on_uia_error():

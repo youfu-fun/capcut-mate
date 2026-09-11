@@ -111,6 +111,10 @@ def _redact(value: str, api_key: str | None) -> str:
 
 def _validate_value(phase: str, value: Any) -> Any:
     if phase == "probe":
+        if isinstance(value, dict):
+            if set(value) != {"ready", "reason"} or type(value["ready"]) is not bool or not isinstance(value["reason"], str) or len(value["reason"]) > 400:
+                raise VideoPhaseProtocolError("VIDEO_PHASE_RESULT_INVALID")
+            return value
         if type(value) is not bool:
             raise VideoPhaseProtocolError("VIDEO_PHASE_RESULT_INVALID")
         return value
@@ -202,6 +206,10 @@ async def run_video_phase(runner: Any, task: Any, phase: str, timeout: float) ->
             _require_output(task.outfile)
         if phase == "download" and not value and not task.outfile:
             raise VideoPhaseProtocolError("VIDEO_PHASE_OUTPUT_PATH_MISSING")
+        if phase == "probe" and isinstance(value, dict):
+            if not value["ready"]:
+                raise VideoPhaseProtocolError("[RPA_NODE_NOT_READY] " + value["reason"])
+            return True
         return value
 
 
@@ -262,42 +270,69 @@ def _start_parent_watchdog(parent_pid: int) -> None:
 
 
 def _probe_homepage(uia: Any) -> bool:
-    """Conservative read-only 5.9 desktop probe; unknown/ambiguous state is not ready."""
+    """Compatibility wrapper for callers needing only the readiness boolean."""
+    return _inspect_homepage(uia)["ready"]
+
+
+def _inspect_homepage(uia: Any) -> dict[str, Any]:
+    """Read only the editor's controls; normal Qt child windows are not modals."""
+    def result(ready: bool, reason: str) -> dict[str, Any]:
+        return {"ready": ready, "reason": reason}
+
+    def blocker(item: Any) -> str:
+        if item.IsOffscreen:
+            return ""
+        class_name = item.ClassName.lower()
+        # A WindowControl can be an ordinary Qt content container. Reject an
+        # editor/export/dialog or an explicitly modal window, not its UIA type.
+        if any(marker in class_name for marker in ("mainwindow", "dialog", "export")) or item.Name.startswith("导出"):
+            return "检测到剪映编辑窗口或弹窗：class=" + class_name[:100]
+        if item.ControlTypeName == "WindowControl":
+            get_pattern = getattr(item, "GetWindowPattern", None)
+            pattern = get_pattern() if callable(get_pattern) else None
+            if pattern is not None and pattern.IsModal:
+                return "检测到剪映模态弹窗：class=" + class_name[:100]
+        return ""
+
     try:
-        roots = [item for item in uia.GetRootControl().GetChildren() if not item.IsOffscreen]
-        homes = [item for item in roots if item.Name == "剪映专业版" and "homepage" in item.ClassName.lower()]
+        roots = uia.GetRootControl().GetChildren()
+        # Match name/class exactly as the existing controller. Do not query
+        # IsOffscreen on every unrelated desktop app: its provider may fail.
+        homes = [item for item in roots if item.Name == "剪映专业版" and "homepage" in item.ClassName.lower() and not item.IsOffscreen]
         if len(homes) != 1:
-            return False
+            return result(False, f"未找到唯一可见剪映首页：匹配数量={len(homes)}")
         home = homes[0]
         if not home.IsEnabled:
-            return False
+            return result(False, "剪映首页被禁用，可能有模态弹窗")
         process_id = home.ProcessId
         if not process_id:
-            return False
-        # A separate editor, export window or modal belonging to this Jianying
-        # process is unsafe even if the home page remains visible behind it.
-        if any(item is not home and (item.ProcessId == process_id or item.Name == "剪映专业版") for item in roots):
-            return False
+            return result(False, "无法读取剪映进程 ID")
+        for item in roots:
+            if item is home:
+                continue
+            if item.ProcessId == process_id or item.Name == "剪映专业版":
+                reason = blocker(item)
+                if reason:
+                    return result(False, reason)
         pending = [(child, 1) for child in home.GetChildren()]
         visited = 0
         while pending:
             item, depth = pending.pop()
             visited += 1
             if visited > 512:
-                return False
+                return result(False, "首页控件扫描超过安全上限，尚未确认弹窗状态")
             if item.IsOffscreen:
                 continue
-            class_name = item.ClassName.lower()
-            if (item.ControlTypeName == "WindowControl"
-                    or any(marker in class_name for marker in ("mainwindow", "dialog", "popup", "export"))):
-                return False
+            reason = blocker(item)
+            if reason:
+                return result(False, reason)
             if depth < 3:
                 pending.extend((child, depth + 1) for child in item.GetChildren())
-        return True
-    except Exception:
+        return result(True, "剪映首页已就绪")
+    except Exception as exc:
         # Includes an unavailable/locked desktop or stale COM elements. No retry
         # and no focus/click fallback; the parent gives this probe a hard timeout.
-        return False
+        return result(False, "首页 UI Automation 读取失败：" + type(exc).__name__)
 
 
 def _execute_request(request: dict[str, Any], status_path: Path) -> Any:
@@ -320,7 +355,7 @@ def _execute_request(request: dict[str, Any], status_path: Path) -> Any:
             return False
         import uiautomation as uia
         with uia.UIAutomationInitializerInThread():
-            return _probe_homepage(uia)
+            return _inspect_homepage(uia)
 
     # Deliberately lazy: module import and probe do not initialize a manager, and
     # none of these synchronous methods calls submit_task or starts the server.
